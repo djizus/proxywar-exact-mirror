@@ -41746,6 +41746,7 @@ var ENGINE_IDENTITY = Object.freeze({
   proxyWarCommit: "84bb064ad199f1e14f0cf45046395bb95c7ce2fe",
   gameImage: "public.ecr.aws/q5f4m8t9/cogames@sha256:71341d0c0b701dc13f0e8afc45b05c2fed94e8cdad8579c0d4b0745de9441d70"
 });
+var HASH_SIGNIFICANT_DIGITS = 15;
 var ExactMirror = class {
   runner = null;
   status = "bootstrapping";
@@ -41997,7 +41998,7 @@ function captureGameState(game, status = "exact") {
     rulesRef: ENGINE_IDENTITY,
     source: { mode: "exact", status, hash: "" }
   };
-  state.source.hash = stateHash(state);
+  state.source.hash = canonicalStateHash(state);
   return state;
 }
 function compareStates(left, right) {
@@ -42122,7 +42123,7 @@ var StaticMapLoader = class {
     };
   }
 };
-function stateHash(state) {
+function canonicalStateHash(state) {
   const hash2 = createHash("sha256");
   const { tileState, source, ...summary } = state;
   hash2.update(stableJSON(summary));
@@ -42139,6 +42140,9 @@ function sortValue(value) {
 }
 function jsonSafe(value) {
   if (typeof value === "bigint") return value.toString();
+  if (typeof value === "number" && Number.isFinite(value) && !Number.isInteger(value)) {
+    return Number(value.toPrecision(HASH_SIGNIFICANT_DIGITS));
+  }
   if (value instanceof Set) return [...value].map(jsonSafe).sort(byJSON);
   if (Array.isArray(value)) return value.map(jsonSafe);
   if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== void 0).map(([key, entry]) => [key, jsonSafe(entry)]));
@@ -42215,6 +42219,7 @@ async function withSilentEngine(operation) {
 export {
   ENGINE_IDENTITY,
   ExactMirror,
+  canonicalStateHash,
   captureGameState,
   compareStates,
   encodeStateJSON,

@@ -24,6 +24,8 @@ export const ENGINE_IDENTITY = Object.freeze({
   gameImage: "public.ecr.aws/q5f4m8t9/cogames@sha256:71341d0c0b701dc13f0e8afc45b05c2fed94e8cdad8579c0d4b0745de9441d70",
 });
 
+const HASH_SIGNIFICANT_DIGITS = 15;
+
 export type MirrorStatus = "bootstrapping" | "exact" | "lagging" | "diverged" | "unavailable";
 
 export type GameState = {
@@ -329,7 +331,7 @@ export function captureGameState(game: Game, status: MirrorStatus = "exact"): Ga
     rulesRef: ENGINE_IDENTITY,
     source: { mode: "exact" as const, status, hash: "" },
   };
-  state.source.hash = stateHash(state);
+  state.source.hash = canonicalStateHash(state);
   return state;
 }
 
@@ -460,7 +462,7 @@ class StaticMapLoader implements GameMapLoader {
   }
 }
 
-function stateHash(state: Omit<GameState, "source"> & { source: GameState["source"] }): string {
+export function canonicalStateHash(state: Omit<GameState, "source"> & { source: GameState["source"] }): string {
   const hash = createHash("sha256");
   const { tileState, source, ...summary } = state;
   hash.update(stableJSON(summary));
@@ -478,6 +480,9 @@ function sortValue(value: unknown): unknown {
 }
 function jsonSafe(value: unknown): unknown {
   if (typeof value === "bigint") return value.toString();
+  if (typeof value === "number" && Number.isFinite(value) && !Number.isInteger(value)) {
+    return Number(value.toPrecision(HASH_SIGNIFICANT_DIGITS));
+  }
   if (value instanceof Set) return [...value].map(jsonSafe).sort(byJSON);
   if (Array.isArray(value)) return value.map(jsonSafe);
   if (value && typeof value === "object") return Object.fromEntries(Object.entries(value as Record<string, unknown>).filter(([, entry]) => entry !== undefined).map(([key, entry]) => [key, jsonSafe(entry)]));

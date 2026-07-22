@@ -12,6 +12,10 @@ Roster identity is retained from the opening snapshot so accepted decisions
 remain replayable when their owner is eliminated during the same interval and
 is absent from the next public player list.
 
+State hashes preserve exact integer and tile data while canonicalizing derived
+floating-point values to 15 significant digits. This removes last-bit runtime
+noise between supported Node versions without hiding material state changes.
+
 The worker uses Node IPC with advanced serialization so the normalized
 `GameState.tileState` remains a `Uint16Array`. It never receives player tokens
 or strategy configuration.

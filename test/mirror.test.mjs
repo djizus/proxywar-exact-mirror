@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { ExactMirror, encodeStateJSON } from "../dist/mirror.mjs";
+import { canonicalStateHash, ExactMirror, encodeStateJSON } from "../dist/mirror.mjs";
 
 const names = [
   "Richard Higgins", "James Boggs", "Auri", "docxology", "Ron SWGY", "RelhAlpha",
@@ -95,6 +95,18 @@ test("completed official replay matches the independently reconstructed live sta
   assert.equal(result.liveStateRef.tick, 400);
   assert.equal(result.officialStateRef.tick, 400);
   assert.equal(result.liveStateRef.hash, result.officialStateRef.hash);
+});
+
+test("canonical hashes ignore cross-runtime last-bit noise in derived floats", async () => {
+  const result = await new ExactMirror().ingest(openingFrame());
+  const left = structuredClone(result.state);
+  const right = structuredClone(result.state);
+  left.players[1].maxTroops = 595107.9344554027;
+  left.players[1].troopRatio = 0.4056642266430604;
+  right.players[1].maxTroops = 595107.9344554028;
+  right.players[1].troopRatio = 0.40566422664306034;
+
+  assert.equal(canonicalStateHash(left), canonicalStateHash(right));
 });
 
 function openingFrame() {
