@@ -50,6 +50,16 @@ test("a confirmed global snapshot gap permanently diverges the match", async () 
   assert.equal(repeated.status, "diverged");
 });
 
+test("completed official replay matches the independently reconstructed live state", async () => {
+  const mirror = new ExactMirror();
+  await mirror.ingest(openingFrame());
+  const result = await mirror.finalize(openingGameRecord());
+  assert.equal(result.status, "exact");
+  assert.equal(result.parity.ok, true);
+  assert.equal(result.liveState.tick, 400);
+  assert.equal(result.officialState, null);
+});
+
 function openingFrame() {
   const players = names.map((username, index) => ({
     agentID: `opportunistic-agent-${index + 1}`,
@@ -95,5 +105,47 @@ function openingFrame() {
       players,
       decisions,
     },
+  };
+}
+
+function openingGameRecord() {
+  const intents = spawnTurns.map((tiles, turnIndex) => ({
+    turnNumber: turnIndex * 100,
+    intents: [
+      ...(turnIndex === 0 ? clients.map((clientID) => ({ type: "mark_disconnected", clientID, isDisconnected: false })) : []),
+      ...tiles.map((tile, playerIndex) => ({ type: "spawn", tile, clientID: clients[playerIndex] })),
+    ],
+  }));
+  return {
+    info: {
+      gameID: "COWRLD01",
+      lobbyCreatedAt: 0,
+      config: {
+        gameMap: "World",
+        gameMapSize: "Normal",
+        gameMode: "Free For All",
+        gameType: "Private",
+        difficulty: "Easy",
+        nations: "disabled",
+        donateGold: true,
+        donateTroops: true,
+        bots: 0,
+        infiniteGold: false,
+        infiniteTroops: false,
+        instantBuild: false,
+        randomSpawn: false,
+        disabledUnits: [],
+        startingGold: 200000,
+        maxPlayers: 12,
+      },
+      players: names.map((username, index) => ({
+        clientID: clients[index],
+        username,
+        clanTag: null,
+        isLobbyCreator: false,
+      })),
+      num_turns: 400,
+    },
+    turns: intents,
   };
 }
