@@ -51,14 +51,50 @@ test("a confirmed global snapshot gap permanently diverges the match", async () 
   assert.equal(repeated.status, "diverged");
 });
 
+test("resolves an interval decision after its player leaves the current roster", async () => {
+  const mirror = new ExactMirror();
+  await mirror.ingest(openingFrame());
+  const frame = structuredClone(openingFrame());
+  frame.snapshotCount = 2;
+  frame.snapshot.players = frame.snapshot.players.slice(1);
+  frame.snapshot.decisions = [{
+    sequence: 37,
+    agentID: "opportunistic-agent-1",
+    username: names[0],
+    turnNumber: 400,
+    accepted: true,
+    intentSummary: JSON.stringify({ type: "emoji", recipient: clients[1], emoji: 25 }),
+  }];
+
+  const result = await mirror.ingest(frame);
+  assert.equal(result.status, "exact");
+  assert.equal(result.snapshotCount, 2);
+  assert.equal(result.parity.ok, true);
+});
+
+test("diverges when a public identity changes client", async () => {
+  const mirror = new ExactMirror();
+  await mirror.ingest(openingFrame());
+  const frame = structuredClone(openingFrame());
+  frame.snapshotCount = 2;
+  frame.snapshot.decisions = [];
+  frame.snapshot.players[0].clientID = "replacement-client";
+
+  const result = await mirror.ingest(frame);
+  assert.equal(result.status, "diverged");
+  assert.equal(result.incident.reason, "mirror_execution_failure");
+  assert.match(result.incident.error, /changed client/);
+});
+
 test("completed official replay matches the independently reconstructed live state", async () => {
   const mirror = new ExactMirror();
   await mirror.ingest(openingFrame());
   const result = await mirror.finalize(openingGameRecord());
   assert.equal(result.status, "exact");
   assert.equal(result.parity.ok, true);
-  assert.equal(result.liveState.tick, 400);
-  assert.equal(result.officialState, null);
+  assert.equal(result.liveStateRef.tick, 400);
+  assert.equal(result.officialStateRef.tick, 400);
+  assert.equal(result.liveStateRef.hash, result.officialStateRef.hash);
 });
 
 function openingFrame() {

@@ -59,6 +59,8 @@ export class ExactMirror {
   private status: MirrorStatus = "bootstrapping";
   private snapshotCount = 0;
   private lastSequence = 0;
+  private readonly clientByAgent = new Map<string, string>();
+  private readonly clientByName = new Map<string, string>();
   private latestState: GameState | null = null;
   private incident: Record<string, unknown> | null = null;
   private readonly mapLoader: StaticMapLoader;
@@ -111,10 +113,10 @@ export class ExactMirror {
       ? { ok: false, checked: [], mismatches: [{ path: "mirror", expected: "state", actual: null }] }
       : compareStates(this.latestState, official);
     return {
-      schemaVersion: 1,
+      schemaVersion: 2,
       status: parity.ok && this.status !== "diverged" ? this.status : "diverged",
-      liveState: this.latestState,
-      officialState: parity.ok ? null : official,
+      liveStateRef: stateRef(this.latestState),
+      officialStateRef: stateRef(official),
       parity,
       incident: this.incident,
     };
@@ -131,6 +133,7 @@ export class ExactMirror {
     const config = asRecord(global.config);
     const publicPlayers = records(snapshot.players);
     if (config === null || publicPlayers.length === 0) throw new Error("bootstrap frame lacks config or players");
+    this.rememberRoster(publicPlayers);
     const gameStartInfo = buildGameStartInfo(config, publicPlayers);
     this.runner = await withSilentEngine(() => createGameRunner(gameStartInfo, undefined, this.mapLoader, () => undefined));
   }
@@ -160,8 +163,7 @@ export class ExactMirror {
 
   private acceptedIntents(snapshot: Record<string, unknown>): Map<number, Intent[]> {
     const players = records(snapshot.players);
-    const clientByAgent = new Map(players.map((player) => [String(player.agentID ?? ""), String(player.clientID ?? "")]));
-    const clientByName = new Map(players.map((player) => [String(player.username ?? ""), String(player.clientID ?? "")]));
+    this.rememberRoster(players);
     const result = new Map<number, Intent[]>();
     for (const decision of records(snapshot.decisions)) {
       const sequence = integer(decision.sequence);
@@ -174,13 +176,22 @@ export class ExactMirror {
       const turn = integer(decision.turnNumber);
       if (turn === null) throw new Error(`decision ${sequence} lacks turnNumber`);
       const parsed = JSON.parse(String(decision.intentSummary));
-      const clientID = clientByAgent.get(String(decision.agentID ?? "")) || clientByName.get(String(decision.username ?? ""));
+      const clientID = this.clientByAgent.get(String(decision.agentID ?? "")) || this.clientByName.get(String(decision.username ?? ""));
       if (!clientID) throw new Error(`decision ${sequence} has no roster client`);
       const batch = result.get(turn) ?? [];
       batch.push({ ...parsed, clientID });
       result.set(turn, batch);
     }
     return result;
+  }
+
+  private rememberRoster(players: Array<Record<string, unknown>>): void {
+    for (const player of players) {
+      const clientID = nonempty(player.clientID);
+      if (clientID === null) continue;
+      rememberIdentity(this.clientByAgent, nonempty(player.agentID), clientID, "agentID");
+      rememberIdentity(this.clientByName, nonempty(player.username), clientID, "username");
+    }
   }
 
   private diverge(reason: string, detail: Record<string, unknown>): Record<string, unknown> {
@@ -329,7 +340,9 @@ export function compareStates(left: GameState, right: GameState): ParityResult {
   for (const key of checked.filter((entry) => entry !== "tileState")) {
     const a = jsonSafe((left as unknown as Record<string, unknown>)[key]);
     const b = jsonSafe((right as unknown as Record<string, unknown>)[key]);
-    if (JSON.stringify(a) !== JSON.stringify(b)) mismatches.push({ path: key, expected: b, actual: a });
+    if (JSON.stringify(a) !== JSON.stringify(b)) {
+      mismatches.push({ path: key, expected: mismatchValue(b), actual: mismatchValue(a) });
+    }
   }
   let tileMismatchCount = 0;
   const examples: Array<{ tile: number; expected: number; actual: number }> = [];
@@ -341,6 +354,20 @@ export function compareStates(left: GameState, right: GameState): ParityResult {
   }
   if (tileMismatchCount) mismatches.push({ path: "tileState", expected: { mismatchCount: tileMismatchCount, examples }, actual: { mismatchCount: tileMismatchCount, examples } });
   return { ok: mismatches.length === 0, checked, mismatches };
+}
+
+function stateRef(state: GameState | null): Record<string, unknown> | null {
+  if (state === null) return null;
+  return { tick: state.tick, status: state.source.status, hash: state.source.hash };
+}
+
+function mismatchValue(value: unknown): unknown {
+  if (value === null || typeof value !== "object") return value;
+  const json = JSON.stringify(value);
+  return {
+    count: Array.isArray(value) ? value.length : Object.keys(value as Record<string, unknown>).length,
+    hash: `sha256:${createHash("sha256").update(json).digest("hex")}`,
+  };
 }
 
 export function encodeStateJSON(state: GameState): Record<string, unknown> {
@@ -470,6 +497,18 @@ function encodeRuns(values: Uint16Array): number[][] {
 }
 function compareValue(mismatches: ParityResult["mismatches"], path: string, actual: unknown, expected: unknown): void {
   if (String(actual) !== String(expected)) mismatches.push({ path, expected, actual });
+}
+function rememberIdentity(map: Map<string, string>, key: string | null, clientID: string, field: string): void {
+  if (key === null) return;
+  const known = map.get(key);
+  if (known !== undefined && known !== clientID) {
+    throw new Error(`roster ${field} ${key} changed client from ${known} to ${clientID}`);
+  }
+  map.set(key, clientID);
+}
+function nonempty(value: unknown): string | null {
+  const result = String(value ?? "").trim();
+  return result ? result : null;
 }
 function defaultMapRoot(): string { return resolve(dirname(fileURLToPath(import.meta.url)), "maps"); }
 function enumValue<T extends Record<string, string>>(values: T, value: unknown): T[keyof T] {

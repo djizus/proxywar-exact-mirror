@@ -1,4 +1,4 @@
-import { ExactMirror, encodeStateJSON } from "./mirror.ts";
+import { ExactMirror } from "./mirror.ts";
 
 const mirror = new ExactMirror({ mapRoot: process.env.PROXYWAR_MIRROR_MAP_ROOT });
 
@@ -19,16 +19,7 @@ async function handle(message: unknown): Promise<Record<string, unknown>> {
     return { id: request.id, ok: true, result: await mirror.ingest(request.frame) };
   }
   if (request.type === "finalize") {
-    const result = await mirror.finalize(request.gameRecord);
-    return {
-      id: request.id,
-      ok: true,
-      result: {
-        ...result,
-        liveState: result.liveState ? encodeStateJSON(result.liveState as never) : null,
-        officialState: result.officialState ? encodeStateJSON(result.officialState as never) : null,
-      },
-    };
+    return { id: request.id, ok: true, result: await mirror.finalize(request.gameRecord) };
   }
   throw new Error(`unknown mirror operation ${String(request.type)}`);
 }
@@ -36,4 +27,3 @@ async function handle(message: unknown): Promise<Record<string, unknown>> {
 function requestID(message: unknown): unknown {
   return message !== null && typeof message === "object" ? (message as Record<string, unknown>).id : null;
 }
-

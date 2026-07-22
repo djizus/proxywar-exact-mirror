@@ -41751,6 +41751,8 @@ var ExactMirror = class {
   status = "bootstrapping";
   snapshotCount = 0;
   lastSequence = 0;
+  clientByAgent = /* @__PURE__ */ new Map();
+  clientByName = /* @__PURE__ */ new Map();
   latestState = null;
   incident = null;
   mapLoader;
@@ -41797,10 +41799,10 @@ var ExactMirror = class {
     const official = await replayGameRecord(gameRecord, { mapLoader: this.mapLoader });
     const parity = this.latestState === null ? { ok: false, checked: [], mismatches: [{ path: "mirror", expected: "state", actual: null }] } : compareStates(this.latestState, official);
     return {
-      schemaVersion: 1,
+      schemaVersion: 2,
       status: parity.ok && this.status !== "diverged" ? this.status : "diverged",
-      liveState: this.latestState,
-      officialState: parity.ok ? null : official,
+      liveStateRef: stateRef(this.latestState),
+      officialStateRef: stateRef(official),
       parity,
       incident: this.incident
     };
@@ -41815,6 +41817,7 @@ var ExactMirror = class {
     const config2 = asRecord(global.config);
     const publicPlayers = records(snapshot.players);
     if (config2 === null || publicPlayers.length === 0) throw new Error("bootstrap frame lacks config or players");
+    this.rememberRoster(publicPlayers);
     const gameStartInfo = buildGameStartInfo(config2, publicPlayers);
     this.runner = await withSilentEngine(() => createGameRunner(gameStartInfo, void 0, this.mapLoader, () => void 0));
   }
@@ -41842,8 +41845,7 @@ var ExactMirror = class {
   }
   acceptedIntents(snapshot) {
     const players = records(snapshot.players);
-    const clientByAgent = new Map(players.map((player) => [String(player.agentID ?? ""), String(player.clientID ?? "")]));
-    const clientByName = new Map(players.map((player) => [String(player.username ?? ""), String(player.clientID ?? "")]));
+    this.rememberRoster(players);
     const result = /* @__PURE__ */ new Map();
     for (const decision of records(snapshot.decisions)) {
       const sequence = integer2(decision.sequence);
@@ -41856,13 +41858,21 @@ var ExactMirror = class {
       const turn = integer2(decision.turnNumber);
       if (turn === null) throw new Error(`decision ${sequence} lacks turnNumber`);
       const parsed = JSON.parse(String(decision.intentSummary));
-      const clientID = clientByAgent.get(String(decision.agentID ?? "")) || clientByName.get(String(decision.username ?? ""));
+      const clientID = this.clientByAgent.get(String(decision.agentID ?? "")) || this.clientByName.get(String(decision.username ?? ""));
       if (!clientID) throw new Error(`decision ${sequence} has no roster client`);
       const batch = result.get(turn) ?? [];
       batch.push({ ...parsed, clientID });
       result.set(turn, batch);
     }
     return result;
+  }
+  rememberRoster(players) {
+    for (const player of players) {
+      const clientID = nonempty(player.clientID);
+      if (clientID === null) continue;
+      rememberIdentity(this.clientByAgent, nonempty(player.agentID), clientID, "agentID");
+      rememberIdentity(this.clientByName, nonempty(player.username), clientID, "username");
+    }
   }
   diverge(reason, detail) {
     this.status = "diverged";
@@ -41997,7 +42007,9 @@ function compareStates(left, right) {
   for (const key of checked.filter((entry) => entry !== "tileState")) {
     const a5 = jsonSafe(left[key]);
     const b5 = jsonSafe(right[key]);
-    if (JSON.stringify(a5) !== JSON.stringify(b5)) mismatches.push({ path: key, expected: b5, actual: a5 });
+    if (JSON.stringify(a5) !== JSON.stringify(b5)) {
+      mismatches.push({ path: key, expected: mismatchValue(b5), actual: mismatchValue(a5) });
+    }
   }
   let tileMismatchCount = 0;
   const examples = [];
@@ -42009,6 +42021,18 @@ function compareStates(left, right) {
   }
   if (tileMismatchCount) mismatches.push({ path: "tileState", expected: { mismatchCount: tileMismatchCount, examples }, actual: { mismatchCount: tileMismatchCount, examples } });
   return { ok: mismatches.length === 0, checked, mismatches };
+}
+function stateRef(state) {
+  if (state === null) return null;
+  return { tick: state.tick, status: state.source.status, hash: state.source.hash };
+}
+function mismatchValue(value) {
+  if (value === null || typeof value !== "object") return value;
+  const json2 = JSON.stringify(value);
+  return {
+    count: Array.isArray(value) ? value.length : Object.keys(value).length,
+    hash: `sha256:${createHash("sha256").update(json2).digest("hex")}`
+  };
 }
 function encodeStateJSON(state) {
   return {
@@ -42138,6 +42162,18 @@ function encodeRuns(values) {
 }
 function compareValue(mismatches, path, actual, expected) {
   if (String(actual) !== String(expected)) mismatches.push({ path, expected, actual });
+}
+function rememberIdentity(map2, key, clientID, field) {
+  if (key === null) return;
+  const known = map2.get(key);
+  if (known !== void 0 && known !== clientID) {
+    throw new Error(`roster ${field} ${key} changed client from ${known} to ${clientID}`);
+  }
+  map2.set(key, clientID);
+}
+function nonempty(value) {
+  const result = String(value ?? "").trim();
+  return result ? result : null;
 }
 function defaultMapRoot() {
   return resolve(dirname(fileURLToPath(import.meta.url)), "maps");
