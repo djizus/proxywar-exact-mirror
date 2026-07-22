@@ -251,6 +251,10 @@ export function captureGameState(game: Game, status: MirrorStatus = "exact"): Ga
       .filter((other) => other.id() !== player.id() && player.sharesBorderWith(other))
       .map((other) => other.id())
       .sort(),
+    attackablePlayerIDs: canonicalPlayers
+      .filter((other) => other.id() !== player.id() && player.sharesBorderWith(other) && player.canAttackPlayer(other))
+      .map((other) => other.id())
+      .sort(),
     troops: player.troops(),
     maxTroops: game.config().maxTroops(player),
     troopRatio: player.troops() / Math.max(1, game.config().maxTroops(player)),
