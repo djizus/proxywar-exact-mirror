@@ -41925,6 +41925,7 @@ function captureGameState(game, status = "exact") {
     spawnTile: player.spawnTile() ?? null,
     tilesOwned: player.numTilesOwned(),
     borderTiles: player.borderTiles().size,
+    sharedBorderPlayerIDs: canonicalPlayers.filter((other) => other.id() !== player.id() && player.sharesBorderWith(other)).map((other) => other.id()).sort(),
     troops: player.troops(),
     gold: player.gold().toString(),
     targets: player.targets().map((other) => other.id()).sort(),
