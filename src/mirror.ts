@@ -252,6 +252,10 @@ export function captureGameState(game: Game, status: MirrorStatus = "exact"): Ga
       .map((other) => other.id())
       .sort(),
     troops: player.troops(),
+    maxTroops: game.config().maxTroops(player),
+    troopRatio: player.troops() / Math.max(1, game.config().maxTroops(player)),
+    landShare: player.numTilesOwned() / Math.max(1, game.numLandTiles()),
+    dominationShare: player.numTilesOwned() / Math.max(1, game.numLandTiles() - game.numTilesWithFallout()),
     gold: player.gold().toString(),
     targets: player.targets().map((other) => other.id()).sort(),
     embargoes: player.getEmbargoes().map((entry) => ({

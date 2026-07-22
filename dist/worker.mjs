@@ -41927,6 +41927,10 @@ function captureGameState(game, status = "exact") {
     borderTiles: player.borderTiles().size,
     sharedBorderPlayerIDs: canonicalPlayers.filter((other) => other.id() !== player.id() && player.sharesBorderWith(other)).map((other) => other.id()).sort(),
     troops: player.troops(),
+    maxTroops: game.config().maxTroops(player),
+    troopRatio: player.troops() / Math.max(1, game.config().maxTroops(player)),
+    landShare: player.numTilesOwned() / Math.max(1, game.numLandTiles()),
+    dominationShare: player.numTilesOwned() / Math.max(1, game.numLandTiles() - game.numTilesWithFallout()),
     gold: player.gold().toString(),
     targets: player.targets().map((other) => other.id()).sort(),
     embargoes: player.getEmbargoes().map((entry) => ({

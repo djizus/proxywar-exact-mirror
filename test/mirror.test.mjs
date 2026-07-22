@@ -30,6 +30,7 @@ test("bootstraps an exact World mirror from the first public snapshot", async ()
   assert.equal(result.state.tick, 400);
   assert.equal(result.state.players.length, 12);
   assert.ok(result.state.players.every((player) => Array.isArray(player.sharedBorderPlayerIDs)));
+  assert.ok(result.state.players.every((player) => player.maxTroops > 0));
   assert.equal(result.state.tileState.length, 2_000_000);
   assert.match(result.state.source.hash, /^sha256:[0-9a-f]{64}$/);
 
