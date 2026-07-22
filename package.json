@@ -1,0 +1,27 @@
+{
+  "name": "@djizus/proxywar-exact-mirror",
+  "version": "0.1.0",
+  "type": "module",
+  "private": false,
+  "license": "AGPL-3.0-only",
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "exports": {
+    ".": "./dist/mirror.mjs"
+  },
+  "bin": {
+    "proxywar-exact-mirror": "./dist/worker.mjs"
+  },
+  "scripts": {
+    "setup": "npm --prefix vendor/proxywar ci --ignore-scripts",
+    "build": "node scripts/build.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
+

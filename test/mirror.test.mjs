@@ -1,0 +1,98 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { ExactMirror, encodeStateJSON } from "../dist/mirror.mjs";
+
+const names = [
+  "Richard Higgins", "James Boggs", "Auri", "docxology", "Ron SWGY", "RelhAlpha",
+  "K1Z odin free", "K1Z katanasan", "K1Z juryoku koku", "K1Z Hrafn", "Sefirot", "daveey",
+];
+const clients = [
+  "ZfJsVWEg", "Qfw6Lj6w", "W6ShVkxn", "4UaEMZuJ", "AEQvm1e6", "DXPkGocK",
+  "WruoXSEv", "uWtSRx6W", "2PR9B2Bk", "JqaMpBN2", "XjcM28yS", "HnP6DYM2",
+];
+const playerIDs = [
+  "c4o8gv6v", "28k1hctz", "r5o3pta1", "xbt2wt14", "9h8tnrym", "25ze9gxs",
+  "idjkf73n", "sjh3tur2", "2rmhbq4h", "x262ww19", "1wy62oh4", "a6xyjvhc",
+];
+const spawnTurns = [
+  [1072586, 1218602, 617498, 498354, 621396, 1129100, 994502, 1080668, 751428, 866466, 601156, 246312],
+  [1072586, 1208632, 617498, 494334, 1333674, 628394, 994502, 517574, 1080668, 1376618, 249490, 247586],
+  [1088580, 1216626, 877134, 659476, 629398, 500334, 628394, 1333674, 1080668, 373314, 673074, 997490],
+];
+
+test("bootstraps an exact World mirror from the first public snapshot", async () => {
+  const mirror = new ExactMirror();
+  const result = await mirror.ingest(openingFrame());
+
+  assert.equal(result.status, "exact");
+  assert.equal(result.parity.ok, true);
+  assert.equal(result.state.tick, 400);
+  assert.equal(result.state.players.length, 12);
+  assert.equal(result.state.tileState.length, 2_000_000);
+  assert.match(result.state.source.hash, /^sha256:[0-9a-f]{64}$/);
+
+  const encoded = encodeStateJSON(result.state);
+  assert.equal(encoded.tileState.encoding, "uint16-rle");
+  assert.equal(encoded.tileState.length, 2_000_000);
+});
+
+test("a confirmed global snapshot gap permanently diverges the match", async () => {
+  const mirror = new ExactMirror();
+  await mirror.ingest(openingFrame());
+  const gap = await mirror.ingest({ ...openingFrame(), snapshotCount: 3 });
+  assert.equal(gap.status, "diverged");
+  assert.equal(gap.incident.reason, "global_snapshot_gap");
+
+  const repeated = await mirror.ingest({ ...openingFrame(), snapshotCount: 2 });
+  assert.equal(repeated.status, "diverged");
+});
+
+function openingFrame() {
+  const players = names.map((username, index) => ({
+    agentID: `opportunistic-agent-${index + 1}`,
+    clientID: clients[index],
+    playerID: playerIDs[index],
+    username,
+    isAlive: true,
+    hasSpawned: true,
+    tilesOwned: 52,
+    troops: 62518,
+    gold: "209800",
+    tiles: [],
+    units: [],
+  }));
+  const decisions = spawnTurns.flatMap((tiles, turnIndex) => tiles.map((tile, playerIndex) => ({
+    sequence: turnIndex * 12 + playerIndex + 1,
+    agentID: `opportunistic-agent-${playerIndex + 1}`,
+    username: names[playerIndex],
+    turnNumber: turnIndex * 100,
+    accepted: true,
+    intentSummary: JSON.stringify({ type: "spawn", tile }),
+  })));
+  return {
+    type: "state",
+    event: "snapshot",
+    snapshotCount: 1,
+    config: {
+      players: names.map((name) => ({ name })),
+      max_decision_steps: 500,
+      turns_per_decision_step: 100,
+      max_decision_ms: 15000,
+      map: "World",
+      map_size: "Normal",
+      difficulty: "Easy",
+      player_count: 12,
+    },
+    map: { width: 2000, height: 1000, gameMap: "World", gameMapSize: "Normal" },
+    snapshot: {
+      label: "After spawn",
+      turnNumber: 400,
+      tick: 400,
+      phase: "active",
+      players,
+      decisions,
+    },
+  };
+}
+

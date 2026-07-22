@@ -1,0 +1,4 @@
+node_modules/
+vendor/proxywar/node_modules/
+.cache/
+

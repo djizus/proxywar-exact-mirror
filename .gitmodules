@@ -1,0 +1,3 @@
+[submodule "vendor/proxywar"]
+	path = vendor/proxywar
+	url = https://github.com/0xNad/ProxyWar.git
