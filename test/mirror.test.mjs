@@ -103,8 +103,10 @@ test("canonical hashes ignore cross-runtime last-bit noise in derived floats", a
   const right = structuredClone(result.state);
   left.players[1].maxTroops = 595107.9344554027;
   left.players[1].troopRatio = 0.4056642266430604;
+  left.attacks = [{ troops: 197.5591664912373 }];
   right.players[1].maxTroops = 595107.9344554028;
   right.players[1].troopRatio = 0.40566422664306034;
+  right.attacks = [{ troops: 197.55916649224935 }];
 
   assert.equal(canonicalStateHash(left), canonicalStateHash(right));
 });

@@ -13,8 +13,9 @@ remain replayable when their owner is eliminated during the same interval and
 is absent from the next public player list.
 
 State hashes preserve exact integer and tile data while canonicalizing derived
-floating-point values to 15 significant digits. This removes last-bit runtime
-noise between supported Node versions without hiding material state changes.
+floating-point values to 11 significant digits. This covers the measured
+cross-runtime drift in derived and in-flight troop values while retaining much
+more precision than policy decisions consume. Raw state values remain intact.
 
 The worker uses Node IPC with advanced serialization so the normalized
 `GameState.tileState` remains a `Uint16Array`. It never receives player tokens

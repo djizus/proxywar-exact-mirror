@@ -41746,7 +41746,7 @@ var ENGINE_IDENTITY = Object.freeze({
   proxyWarCommit: "84bb064ad199f1e14f0cf45046395bb95c7ce2fe",
   gameImage: "public.ecr.aws/q5f4m8t9/cogames@sha256:71341d0c0b701dc13f0e8afc45b05c2fed94e8cdad8579c0d4b0745de9441d70"
 });
-var HASH_SIGNIFICANT_DIGITS = 15;
+var HASH_SIGNIFICANT_DIGITS = 11;
 var ExactMirror = class {
   runner = null;
   status = "bootstrapping";

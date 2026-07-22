@@ -24,7 +24,7 @@ export const ENGINE_IDENTITY = Object.freeze({
   gameImage: "public.ecr.aws/q5f4m8t9/cogames@sha256:71341d0c0b701dc13f0e8afc45b05c2fed94e8cdad8579c0d4b0745de9441d70",
 });
 
-const HASH_SIGNIFICANT_DIGITS = 15;
+const HASH_SIGNIFICANT_DIGITS = 11;
 
 export type MirrorStatus = "bootstrapping" | "exact" | "lagging" | "diverged" | "unavailable";
 
