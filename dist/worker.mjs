@@ -35771,6 +35771,86 @@ function packMotionPlans(records2) {
   }
   return out;
 }
+function unpackMotionPlans(packed) {
+  if (packed.length < 1) {
+    return [];
+  }
+  const recordCount = packed[0] >>> 0;
+  const records2 = [];
+  let offset = 1;
+  for (let i4 = 0; i4 < recordCount && offset + 1 < packed.length; i4++) {
+    const kind = packed[offset] >>> 0;
+    const wordCount = packed[offset + 1] >>> 0;
+    if (wordCount < 2 || offset + wordCount > packed.length) {
+      break;
+    }
+    switch (kind) {
+      case 1 /* GridPathSet */: {
+        if (wordCount < 2 + 5) {
+          break;
+        }
+        const unitId = packed[offset + 2] >>> 0;
+        const planId = packed[offset + 3] >>> 0;
+        const startTick = packed[offset + 4] >>> 0;
+        const ticksPerStep = packed[offset + 5] >>> 0;
+        const pathLen = packed[offset + 6] >>> 0;
+        const expectedWordCount = 2 + 5 + pathLen;
+        if (expectedWordCount !== wordCount) {
+          break;
+        }
+        const pathStart = offset + 7;
+        const pathEnd = pathStart + pathLen;
+        const path = packed.slice(pathStart, pathEnd);
+        records2.push({
+          kind: "grid",
+          unitId,
+          planId,
+          startTick,
+          ticksPerStep,
+          path
+        });
+        break;
+      }
+      case 2 /* TrainRailPathSet */: {
+        if (wordCount < 2 + 7) {
+          break;
+        }
+        const engineUnitId = packed[offset + 2] >>> 0;
+        const planId = packed[offset + 3] >>> 0;
+        const startTick = packed[offset + 4] >>> 0;
+        const speed = packed[offset + 5] >>> 0;
+        const spacing = packed[offset + 6] >>> 0;
+        const carCount = packed[offset + 7] >>> 0;
+        const pathLen = packed[offset + 8] >>> 0;
+        const expectedWordCount = 2 + 7 + carCount + pathLen;
+        if (expectedWordCount !== wordCount) {
+          break;
+        }
+        const carStart = offset + 9;
+        const carEnd = carStart + carCount;
+        const pathStart = carEnd;
+        const pathEnd = pathStart + pathLen;
+        const carUnitIds = packed.slice(carStart, carEnd);
+        const path = packed.slice(pathStart, pathEnd);
+        records2.push({
+          kind: "train",
+          engineUnitId,
+          carUnitIds,
+          planId,
+          startTick,
+          speed,
+          spacing,
+          path
+        });
+        break;
+      }
+      default:
+        break;
+    }
+    offset += wordCount;
+  }
+  return records2;
+}
 
 // vendor/proxywar/src/core/game/AttackImpl.ts
 var AttackImpl = class {
@@ -41757,10 +41837,14 @@ var ExactMirror = class {
   latestState = null;
   incident = null;
   mapLoader;
+  transportLifecycle = new TransportLifecycleObserver();
+  latestTransportBatch = emptyTransportBatch(0, 0);
   constructor(options = {}) {
     this.mapLoader = new StaticMapLoader(options.mapRoot ?? defaultMapRoot());
   }
   async ingest(frame) {
+    const currentTick = this.runner?.game.ticks() ?? 0;
+    this.latestTransportBatch = emptyTransportBatch(currentTick, currentTick);
     if (this.status === "diverged" || this.status === "unavailable") {
       return this.result(null);
     }
@@ -41778,7 +41862,7 @@ var ExactMirror = class {
     }
     try {
       if (this.runner === null) await this.bootstrap(global, snapshot);
-      await this.advance(snapshot);
+      this.latestTransportBatch = await this.advance(snapshot);
       this.snapshotCount = count;
       const state = captureGameState(this.runner.game, this.status);
       const parity = comparePublicSnapshot(state, global, snapshot);
@@ -41821,7 +41905,12 @@ var ExactMirror = class {
     if (config2 === null || publicPlayers.length === 0) throw new Error("bootstrap frame lacks config or players");
     this.rememberRoster(publicPlayers);
     const gameStartInfo = buildGameStartInfo(config2, publicPlayers);
-    this.runner = await withSilentEngine(() => createGameRunner(gameStartInfo, void 0, this.mapLoader, () => void 0));
+    this.runner = await withSilentEngine(() => createGameRunner(
+      gameStartInfo,
+      void 0,
+      this.mapLoader,
+      (update) => this.transportLifecycle.captureRunnerUpdate(update)
+    ));
   }
   async advance(snapshot) {
     const targetTick = integer2(snapshot.tick);
@@ -41837,13 +41926,19 @@ var ExactMirror = class {
       }));
       intents.set(0, [...connected, ...intents.get(0) ?? []]);
     }
+    const fromTick = this.runner.game.ticks();
+    this.transportLifecycle.beginBatch(fromTick);
     while (this.runner.game.ticks() < targetTick) {
       const turnNumber = this.runner.game.ticks();
       const turn = { turnNumber, intents: intents.get(turnNumber) ?? [] };
+      const before = this.transportLifecycle.beforeTick(this.runner.game);
+      const boatIntents = boatIntentContexts(this.runner.game, turn.intents);
       this.runner.addTurn(turn);
       const executed = await withSilentEngine(() => this.runner.executeNextTick());
       if (!executed) throw new Error(`canonical runner rejected turn ${turnNumber}`);
+      this.transportLifecycle.afterTick(this.runner.game, before, boatIntents);
     }
+    return this.transportLifecycle.endBatch(targetTick);
   }
   acceptedIntents(snapshot) {
     const players = records(snapshot.players);
@@ -41892,16 +41987,275 @@ var ExactMirror = class {
   }
   result(parity) {
     return {
-      schemaVersion: 1,
+      schemaVersion: 2,
       status: this.status,
       engine: ENGINE_IDENTITY,
       snapshotCount: this.snapshotCount,
       state: this.latestState,
+      transportLifecycle: this.latestTransportBatch,
       parity,
       incident: this.incident
     };
   }
 };
+var TransportLifecycleObserver = class {
+  events = [];
+  tracked = /* @__PURE__ */ new Map();
+  pendingArrivals = [];
+  latestRunnerUpdate = null;
+  fromTick = 0;
+  eventSequence = 0;
+  beginBatch(fromTick) {
+    this.fromTick = fromTick;
+    this.events = [];
+    this.latestRunnerUpdate = null;
+  }
+  captureRunnerUpdate(update) {
+    if ("tick" in update) this.latestRunnerUpdate = update;
+  }
+  beforeTick(game) {
+    return new Map(
+      game.units().filter((unit) => unit.type() === "Transport" /* TransportShip */).map((unit) => [unit.id(), unit])
+    );
+  }
+  afterTick(game, before, boatIntents) {
+    const tick = game.ticks();
+    const after = this.beforeTick(game);
+    const spawnedByOwner = /* @__PURE__ */ new Map();
+    for (const [unitID, unit] of after) {
+      const previous = before.get(unitID);
+      if (previous === void 0) {
+        const transport = transportRecord(game, unit);
+        this.tracked.set(unitID, transport);
+        const ownerKey = transport.ownerPlayerID ?? "";
+        const spawned = spawnedByOwner.get(ownerKey) ?? [];
+        spawned.push(transport);
+        spawnedByOwner.set(ownerKey, spawned);
+        this.emit({
+          type: "launch_observed",
+          tick,
+          unitID,
+          ownerPlayerID: transport.ownerPlayerID,
+          targetPlayerID: transport.targetPlayerID,
+          sourceTile: transport.sourceTile,
+          currentTile: unit.tile(),
+          targetTile: transport.targetTile,
+          troops: transport.troops
+        });
+        continue;
+      }
+      const tracked = this.tracked.get(unitID) ?? transportRecord(game, unit);
+      const retreating = unit.transportShipState().isRetreating;
+      if (!tracked.retreating && retreating) {
+        this.emit({
+          type: "retreat_started",
+          tick,
+          unitID,
+          ownerPlayerID: tracked.ownerPlayerID,
+          targetPlayerID: tracked.targetPlayerID,
+          currentTile: unit.tile(),
+          targetTile: nullableInteger(unit.targetTile()),
+          troops: unit.troops()
+        });
+      }
+      this.tracked.set(unitID, {
+        ...tracked,
+        targetTile: nullableInteger(unit.targetTile()),
+        troops: unit.troops(),
+        retreating
+      });
+    }
+    for (const intent of boatIntents) {
+      const candidates = spawnedByOwner.get(intent.ownerPlayerID ?? "") ?? [];
+      const match = candidates.find(
+        (entry) => Math.abs(entry.troops - intent.troops) <= 1
+      ) ?? candidates[0];
+      if (match !== void 0) {
+        candidates.splice(candidates.indexOf(match), 1);
+        continue;
+      }
+      this.emit({
+        type: "launch_failed",
+        tick,
+        unitID: null,
+        ownerPlayerID: intent.ownerPlayerID,
+        targetPlayerID: intent.targetPlayerID,
+        requestedTile: intent.requestedTile,
+        troops: intent.troops
+      });
+    }
+    for (const [unitID, unit] of before) {
+      if (after.has(unitID) || unit.isActive()) continue;
+      const tracked = this.tracked.get(unitID) ?? transportRecord(game, unit);
+      this.observeTerminal(game, unit, tracked, tick);
+      this.tracked.delete(unitID);
+    }
+    this.observeMotionPlans(after, tick);
+    this.observeAttackConversions(game, tick);
+    this.latestRunnerUpdate = null;
+  }
+  endBatch(toTick) {
+    return {
+      schemaVersion: 1,
+      fromTick: this.fromTick,
+      toTick,
+      events: this.events.map((event) => ({ ...event }))
+    };
+  }
+  observeTerminal(game, unit, tracked, tick) {
+    const currentTile = unit.tile();
+    const targetTile = nullableInteger(unit.targetTile()) ?? tracked.targetTile;
+    const retreating = unit.transportShipState().isRetreating || tracked.retreating;
+    const common = {
+      tick,
+      unitID: tracked.unitID,
+      ownerPlayerID: tracked.ownerPlayerID,
+      targetPlayerID: tracked.targetPlayerID,
+      sourceTile: tracked.sourceTile,
+      currentTile,
+      targetTile,
+      troops: unit.troops()
+    };
+    if (unit.wasDestroyedByEnemy()) {
+      this.emit({
+        type: "destroyed",
+        ...common,
+        destroyerPlayerID: identifier(unit.destroyer()?.id())
+      });
+      return;
+    }
+    if (retreating) {
+      this.emit({ type: "retreat_returned", ...common });
+      return;
+    }
+    if (targetTile !== null && currentTile === targetTile) {
+      const owner = playerByID(game, tracked.ownerPlayerID);
+      const target = playerByID(game, tracked.targetPlayerID);
+      if (owner !== null && target !== null && owner.isFriendly(target)) {
+        this.emit({ type: "friendly_returned", ...common });
+        return;
+      }
+      this.emit({ type: "arrived", ...common });
+      this.pendingArrivals.push({
+        unitID: tracked.unitID,
+        ownerPlayerID: tracked.ownerPlayerID,
+        targetPlayerID: tracked.targetPlayerID,
+        targetTile,
+        troops: unit.troops(),
+        tick
+      });
+      return;
+    }
+    this.emit({ type: "path_failed", ...common });
+  }
+  observeMotionPlans(active, tick) {
+    const packed = this.latestRunnerUpdate?.packedMotionPlans;
+    if (packed === void 0) return;
+    for (const plan of unpackMotionPlans(packed)) {
+      if (plan.kind !== "grid") continue;
+      const unit = active.get(plan.unitId);
+      const tracked = this.tracked.get(plan.unitId);
+      if (unit === void 0 || tracked === void 0) continue;
+      this.emit(planEvent(plan, unit, tracked, tick));
+    }
+  }
+  observeAttackConversions(game, tick) {
+    if (this.pendingArrivals.length === 0) return;
+    const attacks = game.allPlayers().filter((player) => player.isPlayer()).flatMap((player) => player.outgoingAttacks());
+    const remaining = [];
+    const claimed = /* @__PURE__ */ new Set();
+    for (const arrival of this.pendingArrivals) {
+      const match = attacks.find(
+        (attack) => !claimed.has(attack.id()) && identifier(attack.attacker().id()) === arrival.ownerPlayerID && identifier(attack.target().id()) === arrival.targetPlayerID && nullableInteger(attack.sourceTile()) === arrival.targetTile
+      );
+      if (match !== void 0) {
+        claimed.add(match.id());
+        this.emit({
+          type: "attack_converted",
+          tick,
+          unitID: arrival.unitID,
+          ownerPlayerID: arrival.ownerPlayerID,
+          targetPlayerID: arrival.targetPlayerID,
+          targetTile: arrival.targetTile,
+          troops: match.troops(),
+          attackID: match.id()
+        });
+      } else if (tick - arrival.tick <= 2) {
+        remaining.push(arrival);
+      }
+    }
+    this.pendingArrivals = remaining;
+  }
+  emit(event) {
+    this.events.push({
+      eventID: `${event.tick}:${event.unitID ?? "none"}:${event.type}:${this.eventSequence++}`,
+      ...event
+    });
+  }
+};
+function emptyTransportBatch(fromTick, toTick) {
+  return { schemaVersion: 1, fromTick, toTick, events: [] };
+}
+function boatIntentContexts(game, intents) {
+  return intents.flatMap((intent) => {
+    if (intent.type !== "boat") return [];
+    const player = game.playerByClientID(intent.clientID);
+    return [{
+      clientID: intent.clientID,
+      ownerPlayerID: identifier(player?.id()),
+      requestedTile: intent.dst,
+      targetPlayerID: game.isValidRef(intent.dst) ? identifier(game.owner(intent.dst).id()) : null,
+      troops: intent.troops
+    }];
+  });
+}
+function transportRecord(game, unit) {
+  const targetTile = nullableInteger(unit.targetTile());
+  return {
+    unitID: unit.id(),
+    ownerPlayerID: identifier(unit.owner().id()),
+    targetPlayerID: targetTile !== null && game.isValidRef(targetTile) ? identifier(game.owner(targetTile).id()) : null,
+    sourceTile: unit.tile(),
+    targetTile,
+    troops: unit.troops(),
+    retreating: unit.transportShipState().isRetreating
+  };
+}
+function planEvent(plan, unit, tracked, tick) {
+  return {
+    type: "plan_updated",
+    tick,
+    unitID: tracked.unitID,
+    ownerPlayerID: tracked.ownerPlayerID,
+    targetPlayerID: tracked.targetPlayerID,
+    sourceTile: tracked.sourceTile,
+    currentTile: unit.tile(),
+    targetTile: nullableInteger(unit.targetTile()),
+    troops: unit.troops(),
+    planID: plan.planId,
+    pathLength: plan.path.length,
+    ticksPerStep: plan.ticksPerStep,
+    projectedCompletionTick: plan.startTick + Math.max(0, plan.path.length - 1) * Math.max(1, plan.ticksPerStep)
+  };
+}
+function playerByID(game, playerID) {
+  if (playerID === null) return null;
+  try {
+    const player = game.player(playerID);
+    return player.isPlayer() ? player : null;
+  } catch {
+    return null;
+  }
+}
+function identifier(value) {
+  if (value === null || value === void 0) return null;
+  const result = String(value);
+  return result === "" || result === "0" ? null : result;
+}
+function nullableInteger(value) {
+  const result = Number(value);
+  return Number.isInteger(result) && result >= 0 ? result : null;
+}
 async function replayGameRecord(value, options = {}) {
   const record2 = asRecord(value);
   const info = asRecord(record2?.info);

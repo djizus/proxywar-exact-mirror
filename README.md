@@ -8,6 +8,13 @@ bundles the engine and Pangaea/World map assets, and exposes two operations:
 - `finalize(gameRecord)` independently replays the completed official record
   and compares it with the live mirror using compact tick/hash references.
 
+Schema-2 ingest results include a compact `transportLifecycle` batch. The
+mirror observes every canonical engine tick between public snapshots and
+reports transport launch, motion-plan, retreat, arrival, attack-conversion,
+destruction, and path-failure events. Full water paths are not exposed. A
+motion plan provides exact post-launch path length and projected completion;
+pre-launch routes remain estimates owned by the consuming policy.
+
 Every result carries the immutable Coworld, ProxyWar commit, and game-image
 identity used by the worker. Consumers must verify that identity before using
 an exact state as live action authority.

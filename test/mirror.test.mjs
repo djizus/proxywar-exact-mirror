@@ -113,6 +113,153 @@ test("canonical hashes ignore cross-runtime last-bit noise in derived floats", a
   assert.equal(canonicalStateHash(left), canonicalStateHash(right));
 });
 
+test("captures a transport motion plan and terminal event between public snapshots", async () => {
+  const mirror = new ExactMirror();
+  await mirror.ingest(openingFrame());
+  const expansionDecisions = Array.from({ length: 8 }, (_, wave) =>
+    names.map((username, playerIndex) => ({
+      sequence: 37 + wave * names.length + playerIndex,
+      agentID: `opportunistic-agent-${playerIndex + 1}`,
+      username,
+      turnNumber: 400 + wave * 100,
+      accepted: true,
+      intentSummary: JSON.stringify({
+        type: "attack",
+        targetID: null,
+        troops: 20_000,
+      }),
+    }))
+  ).flat();
+  const expanded = await mirror.ingest(intervalFrame({
+    snapshotCount: 2,
+    tick: 1_300,
+    decisions: expansionDecisions,
+  }));
+  assert.equal(expanded.status, "exact");
+  const boat = findBoatIntent(mirror);
+
+  const launchFrame = intervalFrame({
+    snapshotCount: 3,
+    tick: 1_301,
+    decisions: [{
+      sequence: 37 + expansionDecisions.length,
+      agentID: `opportunistic-agent-${boat.playerIndex + 1}`,
+      username: names[boat.playerIndex],
+      turnNumber: 1_300,
+      accepted: true,
+      intentSummary: JSON.stringify({
+        type: "boat",
+        dst: boat.targetTile,
+        troops: 1_000,
+      }),
+    }],
+  });
+  const launched = await mirror.ingest(launchFrame);
+  const launch = launched.transportLifecycle.events.find(
+    (event) => event.type === "launch_observed",
+  );
+  const plan = launched.transportLifecycle.events.find(
+    (event) => event.type === "plan_updated" && event.unitID === launch?.unitID,
+  );
+
+  assert.equal(launched.status, "exact");
+  assert.ok(launch, "expected a transport launch event");
+  assert.ok(plan, "expected a transport motion plan");
+  assert.ok(plan.pathLength >= 2);
+  assert.ok(plan.projectedCompletionTick > 1_301);
+
+  const completed = await mirror.ingest(intervalFrame({
+    snapshotCount: 4,
+    tick: plan.projectedCompletionTick + 2,
+    decisions: [],
+  }));
+  const terminal = completed.transportLifecycle.events.find(
+    (event) =>
+      event.unitID === launch.unitID &&
+      ["arrived", "friendly_returned", "retreat_returned", "destroyed", "path_failed"].includes(event.type),
+  );
+
+  assert.equal(completed.status, "exact");
+  assert.ok(terminal, "expected an exact terminal transport event");
+  assert.equal(terminal.type, "arrived");
+  assert.ok(
+    completed.transportLifecycle.events.some(
+      (event) =>
+        event.type === "attack_converted" &&
+        event.unitID === launch.unitID &&
+        typeof event.attackID === "string",
+    ),
+    "expected the landing to bind to its resulting land attack",
+  );
+});
+
+test("reports an accepted boat intent that cannot spawn", async () => {
+  const mirror = new ExactMirror();
+  await mirror.ingest(openingFrame());
+  const frame = intervalFrame({
+    snapshotCount: 2,
+    tick: 401,
+    decisions: [{
+      sequence: 37,
+      agentID: "opportunistic-agent-1",
+      username: names[0],
+      turnNumber: 400,
+      accepted: true,
+      intentSummary: JSON.stringify({ type: "boat", dst: -1, troops: 1_000 }),
+    }],
+  });
+  const result = await mirror.ingest(frame);
+
+  assert.equal(result.status, "exact");
+  assert.equal(result.transportLifecycle.events.length, 1);
+  assert.equal(result.transportLifecycle.events[0].type, "launch_failed");
+  assert.equal(result.transportLifecycle.events[0].unitID, null);
+});
+
+function findBoatIntent(mirror) {
+  const runner = mirror.runner;
+  const game = runner.game;
+  const players = game.players().filter((player) => player.isPlayer());
+  const candidates = [];
+  for (let playerIndex = 0; playerIndex < players.length; playerIndex++) {
+    const player = players[playerIndex];
+    for (const target of players) {
+      if (target === player || target.spawnTile() === undefined) continue;
+      const targetTile = target.spawnTile();
+      const buildables = runner.playerBuildables(
+        player.id(),
+        game.x(targetTile),
+        game.y(targetTile),
+        ["Transport"],
+      );
+      if (!buildables.some((entry) => entry.type === "Transport" && entry.canBuild)) {
+        continue;
+      }
+      candidates.push({
+        playerIndex,
+        targetTile,
+        distance: Math.hypot(
+          game.x(targetTile) - game.x(player.spawnTile()),
+          game.y(targetTile) - game.y(player.spawnTile()),
+        ),
+      });
+    }
+  }
+  candidates.sort((left, right) => left.distance - right.distance);
+  assert.ok(candidates.length > 0, "opening fixture needs a legal transport route");
+  return candidates[0];
+}
+
+function intervalFrame({ snapshotCount, tick, decisions }) {
+  const frame = openingFrame();
+  frame.snapshotCount = snapshotCount;
+  frame.snapshot.tick = tick;
+  frame.snapshot.turnNumber = tick;
+  frame.snapshot.players = [];
+  frame.snapshot.decisions = decisions;
+  return frame;
+}
+
 function openingFrame() {
   const players = names.map((username, index) => ({
     agentID: `opportunistic-agent-${index + 1}`,

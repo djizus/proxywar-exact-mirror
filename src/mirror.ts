@@ -10,9 +10,19 @@ import {
   GameMapType,
   GameMode,
   GameType,
+  UnitType,
   type Game,
+  type Unit,
 } from "../vendor/proxywar/src/core/game/Game.ts";
 import type { GameMapLoader } from "../vendor/proxywar/src/core/game/GameMapLoader.ts";
+import type {
+  ErrorUpdate,
+  GameUpdateViewData,
+} from "../vendor/proxywar/src/core/game/GameUpdates.ts";
+import {
+  unpackMotionPlans,
+  type GridPathPlan,
+} from "../vendor/proxywar/src/core/game/MotionPlans.ts";
 import type { GameStartInfo, Intent, Turn } from "../vendor/proxywar/src/core/Schemas.ts";
 
 process.env.GAME_ENV ??= "dev";
@@ -56,6 +66,70 @@ export type ParityResult = {
   mismatches: Array<{ path: string; expected: unknown; actual: unknown }>;
 };
 
+export type TransportLifecycleEvent = {
+  eventID: string;
+  type:
+    | "launch_observed"
+    | "launch_failed"
+    | "plan_updated"
+    | "retreat_started"
+    | "arrived"
+    | "attack_converted"
+    | "friendly_returned"
+    | "retreat_returned"
+    | "destroyed"
+    | "path_failed";
+  tick: number;
+  unitID: number | null;
+  ownerPlayerID: string | null;
+  targetPlayerID: string | null;
+  sourceTile?: number | null;
+  currentTile?: number | null;
+  requestedTile?: number | null;
+  targetTile?: number | null;
+  troops?: number;
+  planID?: number;
+  pathLength?: number;
+  ticksPerStep?: number;
+  projectedCompletionTick?: number;
+  attackID?: string;
+  destroyerPlayerID?: string | null;
+};
+
+export type TransportLifecycleBatch = {
+  schemaVersion: 1;
+  fromTick: number;
+  toTick: number;
+  events: TransportLifecycleEvent[];
+};
+
+type TrackedTransport = {
+  unitID: number;
+  ownerPlayerID: string | null;
+  targetPlayerID: string | null;
+  sourceTile: number;
+  targetTile: number | null;
+  troops: number;
+  retreating: boolean;
+};
+
+type PendingArrival = {
+  unitID: number;
+  ownerPlayerID: string | null;
+  targetPlayerID: string | null;
+  targetTile: number | null;
+  troops: number;
+  tick: number;
+};
+
+type BoatIntentContext = {
+  clientID: string;
+  ownerPlayerID: string | null;
+  requestedTile: number;
+  targetPlayerID: string | null;
+  troops: number;
+};
+
 export class ExactMirror {
   private runner: GameRunner | null = null;
   private status: MirrorStatus = "bootstrapping";
@@ -66,12 +140,16 @@ export class ExactMirror {
   private latestState: GameState | null = null;
   private incident: Record<string, unknown> | null = null;
   private readonly mapLoader: StaticMapLoader;
+  private readonly transportLifecycle = new TransportLifecycleObserver();
+  private latestTransportBatch: TransportLifecycleBatch = emptyTransportBatch(0, 0);
 
   constructor(options: { mapRoot?: string } = {}) {
     this.mapLoader = new StaticMapLoader(options.mapRoot ?? defaultMapRoot());
   }
 
   async ingest(frame: unknown): Promise<Record<string, unknown>> {
+    const currentTick = this.runner?.game.ticks() ?? 0;
+    this.latestTransportBatch = emptyTransportBatch(currentTick, currentTick);
     if (this.status === "diverged" || this.status === "unavailable") {
       return this.result(null);
     }
@@ -90,7 +168,7 @@ export class ExactMirror {
 
     try {
       if (this.runner === null) await this.bootstrap(global, snapshot);
-      await this.advance(snapshot);
+      this.latestTransportBatch = await this.advance(snapshot);
       this.snapshotCount = count;
       const state = captureGameState(this.runner!.game, this.status);
       const parity = comparePublicSnapshot(state, global, snapshot);
@@ -138,10 +216,15 @@ export class ExactMirror {
     if (config === null || publicPlayers.length === 0) throw new Error("bootstrap frame lacks config or players");
     this.rememberRoster(publicPlayers);
     const gameStartInfo = buildGameStartInfo(config, publicPlayers);
-    this.runner = await withSilentEngine(() => createGameRunner(gameStartInfo, undefined, this.mapLoader, () => undefined));
+    this.runner = await withSilentEngine(() => createGameRunner(
+      gameStartInfo,
+      undefined,
+      this.mapLoader,
+      (update) => this.transportLifecycle.captureRunnerUpdate(update),
+    ));
   }
 
-  private async advance(snapshot: Record<string, unknown>): Promise<void> {
+  private async advance(snapshot: Record<string, unknown>): Promise<TransportLifecycleBatch> {
     const targetTick = integer(snapshot.tick);
     if (targetTick === null || targetTick < this.runner!.game.ticks()) {
       throw new Error(`invalid target tick ${String(snapshot.tick)}`);
@@ -155,13 +238,19 @@ export class ExactMirror {
       }));
       intents.set(0, [...connected, ...(intents.get(0) ?? [])] as Intent[]);
     }
+    const fromTick = this.runner!.game.ticks();
+    this.transportLifecycle.beginBatch(fromTick);
     while (this.runner!.game.ticks() < targetTick) {
       const turnNumber = this.runner!.game.ticks();
       const turn: Turn = { turnNumber, intents: (intents.get(turnNumber) ?? []) as Turn["intents"] };
+      const before = this.transportLifecycle.beforeTick(this.runner!.game);
+      const boatIntents = boatIntentContexts(this.runner!.game, turn.intents);
       this.runner!.addTurn(turn);
       const executed = await withSilentEngine(() => this.runner!.executeNextTick());
       if (!executed) throw new Error(`canonical runner rejected turn ${turnNumber}`);
+      this.transportLifecycle.afterTick(this.runner!.game, before, boatIntents);
     }
+    return this.transportLifecycle.endBatch(targetTick);
   }
 
   private acceptedIntents(snapshot: Record<string, unknown>): Map<number, Intent[]> {
@@ -214,15 +303,344 @@ export class ExactMirror {
 
   private result(parity: ParityResult | null): Record<string, unknown> {
     return {
-      schemaVersion: 1,
+      schemaVersion: 2,
       status: this.status,
       engine: ENGINE_IDENTITY,
       snapshotCount: this.snapshotCount,
       state: this.latestState,
+      transportLifecycle: this.latestTransportBatch,
       parity,
       incident: this.incident,
     };
   }
+}
+
+class TransportLifecycleObserver {
+  private events: TransportLifecycleEvent[] = [];
+  private tracked = new Map<number, TrackedTransport>();
+  private pendingArrivals: PendingArrival[] = [];
+  private latestRunnerUpdate: GameUpdateViewData | null = null;
+  private fromTick = 0;
+  private eventSequence = 0;
+
+  beginBatch(fromTick: number): void {
+    this.fromTick = fromTick;
+    this.events = [];
+    this.latestRunnerUpdate = null;
+  }
+
+  captureRunnerUpdate(update: GameUpdateViewData | ErrorUpdate): void {
+    if ("tick" in update) this.latestRunnerUpdate = update;
+  }
+
+  beforeTick(game: Game): Map<number, Unit> {
+    return new Map(
+      game.units()
+        .filter((unit) => unit.type() === UnitType.TransportShip)
+        .map((unit) => [unit.id(), unit]),
+    );
+  }
+
+  afterTick(
+    game: Game,
+    before: Map<number, Unit>,
+    boatIntents: BoatIntentContext[],
+  ): void {
+    const tick = game.ticks();
+    const after = this.beforeTick(game);
+    const spawnedByOwner = new Map<string, TrackedTransport[]>();
+
+    for (const [unitID, unit] of after) {
+      const previous = before.get(unitID);
+      if (previous === undefined) {
+        const transport = transportRecord(game, unit);
+        this.tracked.set(unitID, transport);
+        const ownerKey = transport.ownerPlayerID ?? "";
+        const spawned = spawnedByOwner.get(ownerKey) ?? [];
+        spawned.push(transport);
+        spawnedByOwner.set(ownerKey, spawned);
+        this.emit({
+          type: "launch_observed",
+          tick,
+          unitID,
+          ownerPlayerID: transport.ownerPlayerID,
+          targetPlayerID: transport.targetPlayerID,
+          sourceTile: transport.sourceTile,
+          currentTile: unit.tile(),
+          targetTile: transport.targetTile,
+          troops: transport.troops,
+        });
+        continue;
+      }
+
+      const tracked = this.tracked.get(unitID) ?? transportRecord(game, unit);
+      const retreating = unit.transportShipState().isRetreating;
+      if (!tracked.retreating && retreating) {
+        this.emit({
+          type: "retreat_started",
+          tick,
+          unitID,
+          ownerPlayerID: tracked.ownerPlayerID,
+          targetPlayerID: tracked.targetPlayerID,
+          currentTile: unit.tile(),
+          targetTile: nullableInteger(unit.targetTile()),
+          troops: unit.troops(),
+        });
+      }
+      this.tracked.set(unitID, {
+        ...tracked,
+        targetTile: nullableInteger(unit.targetTile()),
+        troops: unit.troops(),
+        retreating,
+      });
+    }
+
+    for (const intent of boatIntents) {
+      const candidates = spawnedByOwner.get(intent.ownerPlayerID ?? "") ?? [];
+      const match = candidates.find((entry) =>
+        Math.abs(entry.troops - intent.troops) <= 1
+      ) ?? candidates[0];
+      if (match !== undefined) {
+        candidates.splice(candidates.indexOf(match), 1);
+        continue;
+      }
+      this.emit({
+        type: "launch_failed",
+        tick,
+        unitID: null,
+        ownerPlayerID: intent.ownerPlayerID,
+        targetPlayerID: intent.targetPlayerID,
+        requestedTile: intent.requestedTile,
+        troops: intent.troops,
+      });
+    }
+
+    for (const [unitID, unit] of before) {
+      if (after.has(unitID) || unit.isActive()) continue;
+      const tracked = this.tracked.get(unitID) ?? transportRecord(game, unit);
+      this.observeTerminal(game, unit, tracked, tick);
+      this.tracked.delete(unitID);
+    }
+
+    this.observeMotionPlans(after, tick);
+    this.observeAttackConversions(game, tick);
+    this.latestRunnerUpdate = null;
+  }
+
+  endBatch(toTick: number): TransportLifecycleBatch {
+    return {
+      schemaVersion: 1,
+      fromTick: this.fromTick,
+      toTick,
+      events: this.events.map((event) => ({ ...event })),
+    };
+  }
+
+  private observeTerminal(
+    game: Game,
+    unit: Unit,
+    tracked: TrackedTransport,
+    tick: number,
+  ): void {
+    const currentTile = unit.tile();
+    const targetTile = nullableInteger(unit.targetTile()) ?? tracked.targetTile;
+    const retreating = unit.transportShipState().isRetreating || tracked.retreating;
+    const common = {
+      tick,
+      unitID: tracked.unitID,
+      ownerPlayerID: tracked.ownerPlayerID,
+      targetPlayerID: tracked.targetPlayerID,
+      sourceTile: tracked.sourceTile,
+      currentTile,
+      targetTile,
+      troops: unit.troops(),
+    };
+
+    if (unit.wasDestroyedByEnemy()) {
+      this.emit({
+        type: "destroyed",
+        ...common,
+        destroyerPlayerID: identifier(unit.destroyer()?.id()),
+      });
+      return;
+    }
+    if (retreating) {
+      this.emit({ type: "retreat_returned", ...common });
+      return;
+    }
+    if (targetTile !== null && currentTile === targetTile) {
+      const owner = playerByID(game, tracked.ownerPlayerID);
+      const target = playerByID(game, tracked.targetPlayerID);
+      if (owner !== null && target !== null && owner.isFriendly(target)) {
+        this.emit({ type: "friendly_returned", ...common });
+        return;
+      }
+      this.emit({ type: "arrived", ...common });
+      this.pendingArrivals.push({
+        unitID: tracked.unitID,
+        ownerPlayerID: tracked.ownerPlayerID,
+        targetPlayerID: tracked.targetPlayerID,
+        targetTile,
+        troops: unit.troops(),
+        tick,
+      });
+      return;
+    }
+    this.emit({ type: "path_failed", ...common });
+  }
+
+  private observeMotionPlans(
+    active: Map<number, Unit>,
+    tick: number,
+  ): void {
+    const packed = this.latestRunnerUpdate?.packedMotionPlans;
+    if (packed === undefined) return;
+    for (const plan of unpackMotionPlans(packed)) {
+      if (plan.kind !== "grid") continue;
+      const unit = active.get(plan.unitId);
+      const tracked = this.tracked.get(plan.unitId);
+      if (unit === undefined || tracked === undefined) continue;
+      this.emit(planEvent(plan, unit, tracked, tick));
+    }
+  }
+
+  private observeAttackConversions(
+    game: Game,
+    tick: number,
+  ): void {
+    if (this.pendingArrivals.length === 0) return;
+    const attacks = game.allPlayers()
+      .filter((player) => player.isPlayer())
+      .flatMap((player) => player.outgoingAttacks());
+    const remaining: PendingArrival[] = [];
+    const claimed = new Set<string>();
+    for (const arrival of this.pendingArrivals) {
+      const match = attacks.find((attack) =>
+        !claimed.has(attack.id()) &&
+        identifier(attack.attacker().id()) === arrival.ownerPlayerID &&
+        identifier(attack.target().id()) === arrival.targetPlayerID &&
+        nullableInteger(attack.sourceTile()) === arrival.targetTile
+      );
+      if (match !== undefined) {
+        claimed.add(match.id());
+        this.emit({
+          type: "attack_converted",
+          tick,
+          unitID: arrival.unitID,
+          ownerPlayerID: arrival.ownerPlayerID,
+          targetPlayerID: arrival.targetPlayerID,
+          targetTile: arrival.targetTile,
+          troops: match.troops(),
+          attackID: match.id(),
+        });
+      } else if (tick - arrival.tick <= 2) {
+        remaining.push(arrival);
+      }
+    }
+    this.pendingArrivals = remaining;
+  }
+
+  private emit(
+    event: Omit<TransportLifecycleEvent, "eventID">,
+  ): void {
+    this.events.push({
+      eventID: `${event.tick}:${event.unitID ?? "none"}:${event.type}:${this.eventSequence++}`,
+      ...event,
+    });
+  }
+}
+
+function emptyTransportBatch(
+  fromTick: number,
+  toTick: number,
+): TransportLifecycleBatch {
+  return { schemaVersion: 1, fromTick, toTick, events: [] };
+}
+
+function boatIntentContexts(
+  game: Game,
+  intents: Turn["intents"],
+): BoatIntentContext[] {
+  return intents.flatMap((intent) => {
+    if (intent.type !== "boat") return [];
+    const player = game.playerByClientID(intent.clientID);
+    return [{
+      clientID: intent.clientID,
+      ownerPlayerID: identifier(player?.id()),
+      requestedTile: intent.dst,
+      targetPlayerID: game.isValidRef(intent.dst)
+        ? identifier(game.owner(intent.dst).id())
+        : null,
+      troops: intent.troops,
+    }];
+  });
+}
+
+function transportRecord(
+  game: Game,
+  unit: Unit,
+): TrackedTransport {
+  const targetTile = nullableInteger(unit.targetTile());
+  return {
+    unitID: unit.id(),
+    ownerPlayerID: identifier(unit.owner().id()),
+    targetPlayerID: targetTile !== null && game.isValidRef(targetTile)
+      ? identifier(game.owner(targetTile).id())
+      : null,
+    sourceTile: unit.tile(),
+    targetTile,
+    troops: unit.troops(),
+    retreating: unit.transportShipState().isRetreating,
+  };
+}
+
+function planEvent(
+  plan: GridPathPlan,
+  unit: Unit,
+  tracked: TrackedTransport,
+  tick: number,
+): Omit<TransportLifecycleEvent, "eventID"> {
+  return {
+    type: "plan_updated",
+    tick,
+    unitID: tracked.unitID,
+    ownerPlayerID: tracked.ownerPlayerID,
+    targetPlayerID: tracked.targetPlayerID,
+    sourceTile: tracked.sourceTile,
+    currentTile: unit.tile(),
+    targetTile: nullableInteger(unit.targetTile()),
+    troops: unit.troops(),
+    planID: plan.planId,
+    pathLength: plan.path.length,
+    ticksPerStep: plan.ticksPerStep,
+    projectedCompletionTick:
+      plan.startTick +
+      Math.max(0, plan.path.length - 1) * Math.max(1, plan.ticksPerStep),
+  };
+}
+
+function playerByID(
+  game: Game,
+  playerID: string | null,
+): ReturnType<Game["player"]> | null {
+  if (playerID === null) return null;
+  try {
+    const player = game.player(playerID);
+    return player.isPlayer() ? player : null;
+  } catch {
+    return null;
+  }
+}
+
+function identifier(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  const result = String(value);
+  return result === "" || result === "0" ? null : result;
+}
+
+function nullableInteger(value: unknown): number | null {
+  const result = Number(value);
+  return Number.isInteger(result) && result >= 0 ? result : null;
 }
 
 export async function replayGameRecord(value: unknown, options: { mapLoader?: GameMapLoader; mapRoot?: string } = {}): Promise<GameState> {
