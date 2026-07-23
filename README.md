@@ -8,6 +8,10 @@ bundles the engine and Pangaea/World map assets, and exposes two operations:
 - `finalize(gameRecord)` independently replays the completed official record
   and compares it with the live mirror using compact tick/hash references.
 
+Every result carries the immutable Coworld, ProxyWar commit, and game-image
+identity used by the worker. Consumers must verify that identity before using
+an exact state as live action authority.
+
 Roster identity is retained from the opening snapshot so accepted decisions
 remain replayable when their owner is eliminated during the same interval and
 is absent from the next public player list.

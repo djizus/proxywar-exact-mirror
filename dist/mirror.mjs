@@ -41802,6 +41802,7 @@ var ExactMirror = class {
     return {
       schemaVersion: 2,
       status: parity.ok && this.status !== "diverged" ? this.status : "diverged",
+      engine: ENGINE_IDENTITY,
       liveStateRef: stateRef(this.latestState),
       officialStateRef: stateRef(official),
       parity,
@@ -41893,6 +41894,7 @@ var ExactMirror = class {
     return {
       schemaVersion: 1,
       status: this.status,
+      engine: ENGINE_IDENTITY,
       snapshotCount: this.snapshotCount,
       state: this.latestState,
       parity,

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { canonicalStateHash, ExactMirror, encodeStateJSON } from "../dist/mirror.mjs";
+import { canonicalStateHash, ENGINE_IDENTITY, ExactMirror, encodeStateJSON } from "../dist/mirror.mjs";
 
 const names = [
   "Richard Higgins", "James Boggs", "Auri", "docxology", "Ron SWGY", "RelhAlpha",
@@ -26,6 +26,7 @@ test("bootstraps an exact World mirror from the first public snapshot", async ()
   const result = await mirror.ingest(openingFrame());
 
   assert.equal(result.status, "exact");
+  assert.deepEqual(result.engine, ENGINE_IDENTITY);
   assert.equal(result.parity.ok, true);
   assert.equal(result.state.tick, 400);
   assert.equal(result.state.players.length, 12);
@@ -91,6 +92,7 @@ test("completed official replay matches the independently reconstructed live sta
   await mirror.ingest(openingFrame());
   const result = await mirror.finalize(openingGameRecord());
   assert.equal(result.status, "exact");
+  assert.deepEqual(result.engine, ENGINE_IDENTITY);
   assert.equal(result.parity.ok, true);
   assert.equal(result.liveStateRef.tick, 400);
   assert.equal(result.officialStateRef.tick, 400);
