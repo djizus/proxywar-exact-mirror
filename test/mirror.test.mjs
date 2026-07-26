@@ -26,6 +26,7 @@ test("bootstraps an exact World mirror from the first public snapshot", async ()
   const result = await mirror.ingest(openingFrame());
 
   assert.equal(result.status, "exact");
+  assert.equal(result.schemaVersion, 3);
   assert.deepEqual(result.engine, ENGINE_IDENTITY);
   assert.equal(result.parity.ok, true);
   assert.equal(result.state.tick, 400);
@@ -35,6 +36,21 @@ test("bootstraps an exact World mirror from the first public snapshot", async ()
   assert.ok(result.state.players.every((player) => player.maxTroops > 0));
   assert.equal(result.state.tileState.length, 2_000_000);
   assert.match(result.state.source.hash, /^sha256:[0-9a-f]{64}$/);
+  assert.equal(canonicalStateHash(result.state), result.state.source.hash);
+  assert.equal("economyStats" in result.state, false);
+  assert.equal(result.economyStats.schemaVersion, 1);
+  assert.equal(result.economyStats.toTick, result.state.tick);
+  assert.equal(result.unitsConstructed.tick, result.state.tick);
+  assert.equal(result.unitsConstructed.players.length, 12);
+  assert.equal(result.attackStats.toTick, result.state.tick);
+  assert.equal(result.mirvLaunches.count, "0");
+  assert.equal(result.borderTargets.tick, result.state.tick);
+  assert.equal(result.staticTerrain.encoding, "uint8-rle");
+  assert.equal(result.staticTerrain.length, result.state.tileState.length);
+  assert.equal(result.waterComponents.encoding, "int32-rle");
+  assert.equal(result.waterComponents.length, result.state.tileState.length);
+  assert.equal(result.railTopology.tick, result.state.tick);
+  assert.equal(result.spawnState.tick, result.state.tick);
 
   const encoded = encodeStateJSON(result.state);
   assert.equal(encoded.tileState.encoding, "uint16-rle");
@@ -183,6 +199,10 @@ test("captures a transport motion plan and terminal event between public snapsho
   assert.ok(terminal, "expected an exact terminal transport event");
   assert.equal(terminal.type, "arrived");
   assert.ok(
+    ["self", "friendly", "hostile", "neutral"].includes(terminal.terminalOwnerClass),
+  );
+  assert.ok(Number.isInteger(terminal.terminalOwnerSmallID));
+  assert.ok(
     completed.transportLifecycle.events.some(
       (event) =>
         event.type === "attack_converted" &&
@@ -214,6 +234,68 @@ test("reports an accepted boat intent that cannot spawn", async () => {
   assert.equal(result.transportLifecycle.events.length, 1);
   assert.equal(result.transportLifecycle.events[0].type, "launch_failed");
   assert.equal(result.transportLifecycle.events[0].unitID, null);
+});
+
+test("observes exact economy participants and retains point sidecars on no-op ingest", async () => {
+  const mirror = new ExactMirror();
+  await mirror.ingest(openingFrame());
+  const [source, destination] = mirror.runner.game.players();
+  mirror.runner.game.stats().boatArriveTrade(source, destination, 12_345n);
+  mirror.runner.game.stats().trainExternalTrade(destination, 678n);
+  mirror.runner.game.stats().trainSelfTrade(source, 678n);
+  const frame = intervalFrame({
+    snapshotCount: 2,
+    tick: 401,
+    decisions: [],
+  });
+  const observed = await mirror.ingest(frame);
+
+  assert.deepEqual(observed.tradeCompletions.events, [{
+    tick: 401,
+    payout: "12345",
+    sourcePortOwnerPlayerID: String(source.id()),
+    destinationPortOwnerPlayerID: String(destination.id()),
+    captured: false,
+    provenance: "exact_stats_call",
+  }]);
+  assert.deepEqual(observed.trainStops.events, [{
+    tick: 401,
+    payout: "678",
+    trainOwnerPlayerID: String(source.id()),
+    stationOwnerPlayerID: String(destination.id()),
+    provenance: "exact_stats_call",
+  }]);
+
+  const repeated = await mirror.ingest(frame);
+  assert.equal(repeated.unitsConstructed.players.length, 12);
+  assert.equal(repeated.unitsConstructed.tick, 401);
+  assert.equal(repeated.mirvLaunches.count, observed.mirvLaunches.count);
+  assert.deepEqual(repeated.spawnState, observed.spawnState);
+  assert.deepEqual(repeated.tradeCompletions.events, []);
+  assert.deepEqual(repeated.trainStops.events, []);
+});
+
+test("same-tick railroad destruction wins over a snap-created segment", () => {
+  const observer = new ExactMirror().passiveSidecars;
+  observer.railroads.set(1, [9]);
+  const updates = Array.from({ length: 23 }, () => []);
+  updates[18].push({
+    originalId: 1,
+    newId1: 2,
+    newId2: 3,
+    tiles1: [10],
+    tiles2: [11],
+  });
+  updates[16].push({ id: 2 });
+
+  observer.captureRunnerUpdate({
+    tick: 1,
+    updates,
+    packedTileUpdates: new Uint32Array(),
+    playerNameViewData: {},
+  });
+
+  assert.deepEqual([...observer.railroads], [[3, [11]]]);
 });
 
 function findBoatIntent(mirror) {

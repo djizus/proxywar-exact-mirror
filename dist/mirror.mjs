@@ -2328,6 +2328,25 @@ function unitTypeGroup(types) {
     }
   };
 }
+var UnitType = /* @__PURE__ */ ((UnitType2) => {
+  UnitType2["TransportShip"] = "Transport";
+  UnitType2["Warship"] = "Warship";
+  UnitType2["Shell"] = "Shell";
+  UnitType2["SAMMissile"] = "SAMMissile";
+  UnitType2["Port"] = "Port";
+  UnitType2["AtomBomb"] = "Atom Bomb";
+  UnitType2["HydrogenBomb"] = "Hydrogen Bomb";
+  UnitType2["TradeShip"] = "Trade Ship";
+  UnitType2["MissileSilo"] = "Missile Silo";
+  UnitType2["DefensePost"] = "Defense Post";
+  UnitType2["SAMLauncher"] = "SAM Launcher";
+  UnitType2["City"] = "City";
+  UnitType2["MIRV"] = "MIRV";
+  UnitType2["MIRVWarhead"] = "MIRV Warhead";
+  UnitType2["Train"] = "Train";
+  UnitType2["Factory"] = "Factory";
+  return UnitType2;
+})(UnitType || {});
 var Nukes = unitTypeGroup([
   "Atom Bomb" /* AtomBomb */,
   "Hydrogen Bomb" /* HydrogenBomb */,
@@ -41838,13 +41857,16 @@ var ExactMirror = class {
   incident = null;
   mapLoader;
   transportLifecycle = new TransportLifecycleObserver();
+  passiveSidecars = new PassiveSidecarObserver();
   latestTransportBatch = emptyTransportBatch(0, 0);
+  latestSidecars = emptyPassiveSidecars(0, 0);
   constructor(options = {}) {
     this.mapLoader = new StaticMapLoader(options.mapRoot ?? defaultMapRoot());
   }
   async ingest(frame) {
     const currentTick = this.runner?.game.ticks() ?? 0;
     this.latestTransportBatch = emptyTransportBatch(currentTick, currentTick);
+    this.latestSidecars = resetPassiveBatches(this.latestSidecars, currentTick);
     if (this.status === "diverged" || this.status === "unavailable") {
       return this.result(null);
     }
@@ -41884,7 +41906,7 @@ var ExactMirror = class {
     const official = await replayGameRecord(gameRecord, { mapLoader: this.mapLoader });
     const parity = this.latestState === null ? { ok: false, checked: [], mismatches: [{ path: "mirror", expected: "state", actual: null }] } : compareStates(this.latestState, official);
     return {
-      schemaVersion: 2,
+      schemaVersion: 3,
       status: parity.ok && this.status !== "diverged" ? this.status : "diverged",
       engine: ENGINE_IDENTITY,
       liveStateRef: stateRef(this.latestState),
@@ -41909,8 +41931,12 @@ var ExactMirror = class {
       gameStartInfo,
       void 0,
       this.mapLoader,
-      (update) => this.transportLifecycle.captureRunnerUpdate(update)
+      (update) => {
+        this.transportLifecycle.captureRunnerUpdate(update);
+        this.passiveSidecars.captureRunnerUpdate(update);
+      }
     ));
+    this.passiveSidecars.captureInitial(this.runner.game);
   }
   async advance(snapshot) {
     const targetTick = integer2(snapshot.tick);
@@ -41928,16 +41954,20 @@ var ExactMirror = class {
     }
     const fromTick = this.runner.game.ticks();
     this.transportLifecycle.beginBatch(fromTick);
+    this.passiveSidecars.beginBatch(fromTick);
     while (this.runner.game.ticks() < targetTick) {
       const turnNumber = this.runner.game.ticks();
       const turn = { turnNumber, intents: intents.get(turnNumber) ?? [] };
       const before = this.transportLifecycle.beforeTick(this.runner.game);
+      const sidecarBefore = this.passiveSidecars.beforeTick(this.runner.game);
       const boatIntents = boatIntentContexts(this.runner.game, turn.intents);
       this.runner.addTurn(turn);
       const executed = await withSilentEngine(() => this.runner.executeNextTick());
       if (!executed) throw new Error(`canonical runner rejected turn ${turnNumber}`);
       this.transportLifecycle.afterTick(this.runner.game, before, boatIntents);
+      this.passiveSidecars.afterTick(this.runner.game, sidecarBefore);
     }
+    this.latestSidecars = this.passiveSidecars.endBatch(this.runner.game, targetTick);
     return this.transportLifecycle.endBatch(targetTick);
   }
   acceptedIntents(snapshot) {
@@ -41987,12 +42017,13 @@ var ExactMirror = class {
   }
   result(parity) {
     return {
-      schemaVersion: 2,
+      schemaVersion: 3,
       status: this.status,
       engine: ENGINE_IDENTITY,
       snapshotCount: this.snapshotCount,
       state: this.latestState,
       transportLifecycle: this.latestTransportBatch,
+      ...this.latestSidecars,
       parity,
       incident: this.incident
     };
@@ -42114,7 +42145,8 @@ var TransportLifecycleObserver = class {
       sourceTile: tracked.sourceTile,
       currentTile,
       targetTile,
-      troops: unit.troops()
+      troops: unit.troops(),
+      ...terminalOwner(game, currentTile, tracked.ownerPlayerID)
     };
     if (unit.wasDestroyedByEnemy()) {
       this.emit({
@@ -42193,8 +42225,370 @@ var TransportLifecycleObserver = class {
     });
   }
 };
+var PassiveSidecarObserver = class {
+  fromTick = 0;
+  economyTicks = [];
+  attackTicks = [];
+  tradeEvents = [];
+  trainEvents = [];
+  pendingTradeEvents = [];
+  pendingTrainEvents = [];
+  pendingExternalTrainStops = [];
+  railroads = /* @__PURE__ */ new Map();
+  initialTerrain = null;
+  emitInitialTerrain = false;
+  waterGraphVersion = null;
+  captureInitial(game) {
+    if (this.initialTerrain !== null) return;
+    const terrain = new Array(game.width() * game.height());
+    for (let tile = 0; tile < terrain.length; tile++) {
+      terrain[tile] = game.terrainByte(tile);
+    }
+    this.initialTerrain = {
+      schemaVersion: 1,
+      tick: game.ticks(),
+      encoding: "uint8-rle",
+      length: terrain.length,
+      runs: encodeIntegerRuns(terrain)
+    };
+    this.emitInitialTerrain = true;
+    this.attachStatsHooks(game);
+  }
+  beginBatch(fromTick) {
+    this.fromTick = fromTick;
+    this.economyTicks = [];
+    this.attackTicks = [];
+    this.tradeEvents = [];
+    this.trainEvents = [];
+  }
+  captureRunnerUpdate(update) {
+    if (!("tick" in update)) return;
+    for (const entry of update.updates[17 /* RailroadConstructionEvent */] ?? []) {
+      this.railroads.set(entry.id, [...entry.tiles]);
+    }
+    for (const entry of update.updates[18 /* RailroadSnapEvent */] ?? []) {
+      this.railroads.delete(entry.originalId);
+      this.railroads.set(entry.newId1, [...entry.tiles1]);
+      this.railroads.set(entry.newId2, [...entry.tiles2]);
+    }
+    for (const entry of update.updates[16 /* RailroadDestructionEvent */] ?? []) {
+      this.railroads.delete(entry.id);
+    }
+  }
+  beforeTick(game) {
+    return { stats: statsSnapshot(game) };
+  }
+  afterTick(game, before) {
+    const tick = game.ticks();
+    const after = statsSnapshot(game);
+    const economyPlayers = [];
+    const attackPlayers = [];
+    for (const player of game.allPlayers().filter((entry) => entry.isPlayer())) {
+      const playerID = String(player.id());
+      const prior = before.stats.get(playerID);
+      const current = after.get(playerID);
+      if (current === void 0) continue;
+      const gold = {
+        work: deltaAt(current.gold, prior?.gold, GOLD_INDEX_WORK),
+        war: deltaAt(current.gold, prior?.gold, GOLD_INDEX_WAR),
+        trade: deltaAt(current.gold, prior?.gold, GOLD_INDEX_TRADE),
+        steal: deltaAt(current.gold, prior?.gold, GOLD_INDEX_STEAL),
+        trainSelf: deltaAt(current.gold, prior?.gold, GOLD_INDEX_TRAIN_SELF),
+        trainOther: deltaAt(current.gold, prior?.gold, GOLD_INDEX_TRAIN_OTHER)
+      };
+      if (Object.values(gold).some((value) => value !== "0")) {
+        economyPlayers.push({
+          playerID,
+          clientID: current.clientID,
+          ...gold
+        });
+      }
+      const attacks = {
+        sent: deltaAt(current.attacks, prior?.attacks, ATTACK_INDEX_SENT),
+        received: deltaAt(current.attacks, prior?.attacks, ATTACK_INDEX_RECV),
+        cancelled: deltaAt(current.attacks, prior?.attacks, ATTACK_INDEX_CANCEL)
+      };
+      if (Object.values(attacks).some((value) => value !== "0")) {
+        attackPlayers.push({
+          playerID,
+          clientID: current.clientID,
+          ...attacks
+        });
+      }
+    }
+    if (economyPlayers.length > 0) {
+      this.economyTicks.push({ tick, players: economyPlayers });
+    }
+    if (attackPlayers.length > 0) {
+      this.attackTicks.push({ tick, players: attackPlayers });
+    }
+    this.flushObservedEvents(tick);
+  }
+  endBatch(game, toTick) {
+    const staticTerrain = this.emitInitialTerrain ? this.initialTerrain : null;
+    this.emitInitialTerrain = false;
+    const graphVersion = game.waterGraphVersion();
+    const waterComponents = this.waterGraphVersion === graphVersion ? null : captureWaterComponents(game, graphVersion);
+    this.waterGraphVersion = graphVersion;
+    return {
+      economyStats: tickBatch(this.fromTick, toTick, this.economyTicks),
+      tradeCompletions: eventBatch(this.fromTick, toTick, this.tradeEvents),
+      trainStops: eventBatch(this.fromTick, toTick, this.trainEvents),
+      unitsConstructed: captureUnitsConstructed(game),
+      attackStats: tickBatch(this.fromTick, toTick, this.attackTicks),
+      mirvLaunches: {
+        schemaVersion: 1,
+        tick: toTick,
+        count: game.stats().numMirvsLaunched().toString()
+      },
+      borderTargets: captureBorderTargets(game),
+      staticTerrain,
+      waterComponents,
+      railTopology: {
+        schemaVersion: 1,
+        tick: toTick,
+        railroads: [...this.railroads].sort(([left], [right]) => left - right).map(([id, tiles]) => ({ id, tiles: [...tiles] }))
+      },
+      spawnState: captureSpawnState(game)
+    };
+  }
+  attachStatsHooks(game) {
+    const stats = game.stats();
+    const boatArriveTrade = stats.boatArriveTrade.bind(stats);
+    stats.boatArriveTrade = (source, destination, gold) => {
+      boatArriveTrade(source, destination, gold);
+      this.pendingTradeEvents.push({
+        payout: String(gold),
+        sourcePortOwnerPlayerID: String(source.id()),
+        destinationPortOwnerPlayerID: String(destination.id()),
+        captured: false,
+        provenance: "exact_stats_call"
+      });
+    };
+    const boatCapturedTrade = stats.boatCapturedTrade.bind(stats);
+    stats.boatCapturedTrade = (recipient, originalSource, gold) => {
+      boatCapturedTrade(recipient, originalSource, gold);
+      this.pendingTradeEvents.push({
+        payout: String(gold),
+        originalSourcePortOwnerPlayerID: String(originalSource.id()),
+        capturedRecipientPlayerID: String(recipient.id()),
+        captured: true,
+        provenance: "exact_stats_call"
+      });
+    };
+    const trainExternalTrade = stats.trainExternalTrade.bind(stats);
+    stats.trainExternalTrade = (stationOwner, gold) => {
+      trainExternalTrade(stationOwner, gold);
+      this.pendingExternalTrainStops.push({
+        payout: String(gold),
+        stationOwnerPlayerID: String(stationOwner.id())
+      });
+    };
+    const trainSelfTrade = stats.trainSelfTrade.bind(stats);
+    stats.trainSelfTrade = (trainOwner, gold) => {
+      trainSelfTrade(trainOwner, gold);
+      const payout = String(gold);
+      const externalIndex = this.pendingExternalTrainStops.findLastIndex((entry) => entry.payout === payout);
+      const external = externalIndex === -1 ? null : this.pendingExternalTrainStops.splice(externalIndex, 1)[0];
+      this.pendingTrainEvents.push({
+        payout,
+        trainOwnerPlayerID: String(trainOwner.id()),
+        stationOwnerPlayerID: external?.stationOwnerPlayerID ?? String(trainOwner.id()),
+        provenance: "exact_stats_call"
+      });
+    };
+  }
+  flushObservedEvents(tick) {
+    this.tradeEvents.push(...this.pendingTradeEvents.map((event) => ({
+      tick,
+      ...event
+    })));
+    this.trainEvents.push(...this.pendingTrainEvents.map((event) => ({
+      tick,
+      ...event
+    })));
+    this.pendingTradeEvents = [];
+    this.pendingTrainEvents = [];
+    if (this.pendingExternalTrainStops.length > 0) {
+      throw new Error("unpaired exact train stop stats call");
+    }
+  }
+};
 function emptyTransportBatch(fromTick, toTick) {
   return { schemaVersion: 1, fromTick, toTick, events: [] };
+}
+function emptyPassiveSidecars(fromTick, toTick) {
+  return {
+    economyStats: tickBatch(fromTick, toTick, []),
+    tradeCompletions: eventBatch(fromTick, toTick, []),
+    trainStops: eventBatch(fromTick, toTick, []),
+    unitsConstructed: { schemaVersion: 1, tick: toTick, players: [] },
+    attackStats: tickBatch(fromTick, toTick, []),
+    mirvLaunches: { schemaVersion: 1, tick: toTick, count: "0" },
+    borderTargets: { schemaVersion: 1, tick: toTick, pairs: [] },
+    staticTerrain: null,
+    waterComponents: null,
+    railTopology: { schemaVersion: 1, tick: toTick, railroads: [] },
+    spawnState: {
+      schemaVersion: 1,
+      tick: toTick,
+      ports: [],
+      tradeShips: [],
+      trains: []
+    }
+  };
+}
+function resetPassiveBatches(current, tick) {
+  return {
+    ...current,
+    economyStats: tickBatch(tick, tick, []),
+    tradeCompletions: eventBatch(tick, tick, []),
+    trainStops: eventBatch(tick, tick, []),
+    attackStats: tickBatch(tick, tick, []),
+    staticTerrain: null,
+    waterComponents: null
+  };
+}
+function tickBatch(fromTick, toTick, ticks) {
+  return { schemaVersion: 1, fromTick, toTick, ticks };
+}
+function eventBatch(fromTick, toTick, events) {
+  return { schemaVersion: 1, fromTick, toTick, events };
+}
+function statsSnapshot(game) {
+  const stats = game.stats().stats();
+  return new Map(game.allPlayers().filter((player) => player.isPlayer() && player.clientID() !== null).map((player) => {
+    const clientID = String(player.clientID());
+    const current = stats[clientID];
+    return [String(player.id()), {
+      playerID: String(player.id()),
+      clientID,
+      gold: bigintArray(current?.gold),
+      attacks: bigintArray(current?.attacks)
+    }];
+  }));
+}
+function bigintArray(value) {
+  return Array.isArray(value) ? value.map((entry) => BigInt(String(entry ?? 0))) : [];
+}
+function deltaAt(current, previous, index) {
+  return ((current[index] ?? 0n) - (previous?.[index] ?? 0n)).toString();
+}
+function captureUnitsConstructed(game) {
+  const types = Object.values(UnitType).sort();
+  return {
+    schemaVersion: 1,
+    tick: game.ticks(),
+    players: game.allPlayers().filter((player) => player.isPlayer()).sort((left, right) => left.smallID() - right.smallID()).map((player) => ({
+      playerID: String(player.id()),
+      smallID: player.smallID(),
+      counts: Object.fromEntries(types.map((type2) => [
+        type2,
+        player.unitsConstructed(type2)
+      ]))
+    }))
+  };
+}
+function captureBorderTargets(game) {
+  const counts = /* @__PURE__ */ new Map();
+  for (const player of game.allPlayers().filter((entry) => entry.isPlayer())) {
+    for (const tile of player.borderTiles()) {
+      for (const neighbor of game.neighbors(tile)) {
+        if (neighbor <= tile) continue;
+        const other = game.owner(neighbor);
+        if (!other.isPlayer() || other.id() === player.id()) continue;
+        const left = player.smallID() < other.smallID() ? player : other;
+        const right = left === player ? other : player;
+        const key = `${left.smallID()}:${right.smallID()}`;
+        const current = counts.get(key) ?? {
+          playerAID: String(left.id()),
+          playerBID: String(right.id()),
+          edges: 0
+        };
+        current.edges++;
+        counts.set(key, current);
+      }
+    }
+  }
+  return {
+    schemaVersion: 1,
+    tick: game.ticks(),
+    pairs: [...counts.values()].sort((left, right) => left.playerAID.localeCompare(right.playerAID) || left.playerBID.localeCompare(right.playerBID))
+  };
+}
+function captureWaterComponents(game, graphVersion) {
+  const components = new Array(game.width() * game.height());
+  for (let tile = 0; tile < components.length; tile++) {
+    components[tile] = game.isWater(tile) ? game.getWaterComponent(tile) ?? -1 : -1;
+  }
+  return {
+    schemaVersion: 1,
+    tick: game.ticks(),
+    graphVersion,
+    encoding: "int32-rle",
+    length: components.length,
+    runs: encodeIntegerRuns(components)
+  };
+}
+function captureSpawnState(game) {
+  const units2 = game.units();
+  return {
+    schemaVersion: 1,
+    tick: game.ticks(),
+    ports: units2.filter((unit) => unit.type() === "Port" /* Port */).map(spawnUnit).sort(byUnitID),
+    tradeShips: units2.filter((unit) => unit.type() === "Trade Ship" /* TradeShip */).map((unit) => ({
+      ...spawnUnit(unit),
+      targetUnitID: unit.targetUnit()?.id() ?? null,
+      targetOwnerPlayerID: identifier(unit.targetUnit()?.owner().id())
+    })).sort(byUnitID),
+    trains: units2.filter((unit) => unit.type() === "Train" /* Train */).map((unit) => ({
+      ...spawnUnit(unit),
+      trainType: unit.trainType() ?? null,
+      loaded: unit.isLoaded() ?? null,
+      reachedTarget: unit.reachedTarget(),
+      targetUnitID: unit.targetUnit()?.id() ?? null
+    })).sort(byUnitID)
+  };
+}
+function spawnUnit(unit) {
+  return {
+    unitID: unit.id(),
+    ownerPlayerID: identifier(unit.owner().id()),
+    tile: unit.tile(),
+    level: unit.level(),
+    active: unit.isActive(),
+    underConstruction: unit.isUnderConstruction(),
+    hasTrainStation: unit.hasTrainStation()
+  };
+}
+function byUnitID(left, right) {
+  return Number(left.unitID) - Number(right.unitID);
+}
+function encodeIntegerRuns(values) {
+  const runs = [];
+  for (const value of values) {
+    const last = runs.at(-1);
+    if (last !== void 0 && last[0] === value) {
+      last[1]++;
+    } else {
+      runs.push([value, 1]);
+    }
+  }
+  return runs;
+}
+function terminalOwner(game, tile, ownerPlayerID) {
+  if (!game.isValidRef(tile)) {
+    return { terminalOwnerClass: "neutral", terminalOwnerSmallID: null };
+  }
+  const terminal = game.owner(tile);
+  if (!terminal.isPlayer()) {
+    return { terminalOwnerClass: "neutral", terminalOwnerSmallID: null };
+  }
+  const owner = playerByID(game, ownerPlayerID);
+  return {
+    terminalOwnerClass: owner !== null && terminal.id() === owner.id() ? "self" : owner !== null && owner.isFriendly(terminal) ? "friendly" : "hostile",
+    terminalOwnerSmallID: terminal.smallID()
+  };
 }
 function boatIntentContexts(game, intents) {
   return intents.flatMap((intent) => {
