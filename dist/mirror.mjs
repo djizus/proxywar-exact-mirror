@@ -2397,6 +2397,14 @@ var Cell = class {
     return this.strRepr;
   }
 };
+var TerrainType = /* @__PURE__ */ ((TerrainType3) => {
+  TerrainType3[TerrainType3["Plains"] = 0] = "Plains";
+  TerrainType3[TerrainType3["Highland"] = 1] = "Highland";
+  TerrainType3[TerrainType3["Mountain"] = 2] = "Mountain";
+  TerrainType3[TerrainType3["Lake"] = 3] = "Lake";
+  TerrainType3[TerrainType3["Ocean"] = 4] = "Ocean";
+  return TerrainType3;
+})(TerrainType || {});
 var PlayerInfo = class {
   constructor(name, playerType, clientID, id, isLobbyCreator = false, clanTag = null) {
     this.name = name;
@@ -41837,6 +41845,43 @@ var GameRunner = class {
   }
 };
 
+// src/protocol.ts
+function parseMirrorRequest(message) {
+  if (!isRecord(message)) {
+    throw new Error("mirror request must be an object");
+  }
+  const id = parseMirrorRequestID(message.id);
+  if (message.type === "ingest") {
+    return { id, type: "ingest", frame: message.frame };
+  }
+  if (message.type === "finalize") {
+    return { id, type: "finalize", gameRecord: message.gameRecord };
+  }
+  throw new Error(
+    `unknown mirror operation ${String(message.type)}; expected ingest or finalize`
+  );
+}
+function mirrorRequestIDForError(message) {
+  if (!isRecord(message)) return null;
+  try {
+    return parseMirrorRequestID(message.id);
+  } catch {
+    return null;
+  }
+}
+function parseMirrorRequestID(value) {
+  if (typeof value === "string" && value.trim().length > 0) return value;
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
+    return value;
+  }
+  throw new Error(
+    "mirror request id must be a non-empty string or non-negative safe integer"
+  );
+}
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 // src/mirror.ts
 process.env.GAME_ENV ??= "dev";
 var ENGINE_IDENTITY = Object.freeze({
@@ -41845,6 +41890,7 @@ var ENGINE_IDENTITY = Object.freeze({
   proxyWarCommit: "84bb064ad199f1e14f0cf45046395bb95c7ce2fe",
   gameImage: "public.ecr.aws/q5f4m8t9/cogames@sha256:71341d0c0b701dc13f0e8afc45b05c2fed94e8cdad8579c0d4b0745de9441d70"
 });
+var CANONICAL_TERRAIN_BYTE_LAYOUT = deriveTerrainByteLayout();
 var HASH_SIGNIFICANT_DIGITS = 11;
 var ExactMirror = class {
   runner = null;
@@ -42235,6 +42281,8 @@ var PassiveSidecarObserver = class {
   pendingTrainEvents = [];
   pendingExternalTrainStops = [];
   railroads = /* @__PURE__ */ new Map();
+  railEvents = [];
+  nextRailEventSequence = 1;
   initialTerrain = null;
   emitInitialTerrain = false;
   waterGraphVersion = null;
@@ -42249,7 +42297,8 @@ var PassiveSidecarObserver = class {
       tick: game.ticks(),
       encoding: "uint8-rle",
       length: terrain.length,
-      runs: encodeIntegerRuns(terrain)
+      runs: encodeIntegerRuns(terrain),
+      byteLayout: CANONICAL_TERRAIN_BYTE_LAYOUT
     };
     this.emitInitialTerrain = true;
     this.attachStatsHooks(game);
@@ -42260,19 +42309,39 @@ var PassiveSidecarObserver = class {
     this.attackTicks = [];
     this.tradeEvents = [];
     this.trainEvents = [];
+    this.railEvents = [];
   }
   captureRunnerUpdate(update) {
     if (!("tick" in update)) return;
     for (const entry of update.updates[17 /* RailroadConstructionEvent */] ?? []) {
       this.railroads.set(entry.id, [...entry.tiles]);
+      this.emitRailEvent({
+        tick: update.tick,
+        type: "constructed",
+        railroad: summarizeRailroad(entry.id, entry.tiles)
+      });
     }
     for (const entry of update.updates[18 /* RailroadSnapEvent */] ?? []) {
       this.railroads.delete(entry.originalId);
       this.railroads.set(entry.newId1, [...entry.tiles1]);
       this.railroads.set(entry.newId2, [...entry.tiles2]);
+      this.emitRailEvent({
+        tick: update.tick,
+        type: "snapped",
+        originalRailroadID: entry.originalId,
+        railroads: [
+          summarizeRailroad(entry.newId1, entry.tiles1),
+          summarizeRailroad(entry.newId2, entry.tiles2)
+        ]
+      });
     }
     for (const entry of update.updates[16 /* RailroadDestructionEvent */] ?? []) {
       this.railroads.delete(entry.id);
+      this.emitRailEvent({
+        tick: update.tick,
+        type: "destroyed",
+        railroadID: entry.id
+      });
     }
   }
   beforeTick(game) {
@@ -42347,10 +42416,19 @@ var PassiveSidecarObserver = class {
       railTopology: {
         schemaVersion: 1,
         tick: toTick,
-        railroads: [...this.railroads].sort(([left], [right]) => left - right).map(([id, tiles]) => ({ id, tiles: [...tiles] }))
+        fromTick: this.fromTick,
+        toTick,
+        railroads: [...this.railroads].sort(([left], [right]) => left - right).map(([id, tiles]) => ({ id, tiles: [...tiles] })),
+        events: [...this.railEvents]
       },
       spawnState: captureSpawnState(game)
     };
+  }
+  emitRailEvent(event) {
+    this.railEvents.push({
+      sequence: this.nextRailEventSequence++,
+      ...event
+    });
   }
   attachStatsHooks(game) {
     const stats = game.stats();
@@ -42428,7 +42506,14 @@ function emptyPassiveSidecars(fromTick, toTick) {
     borderTargets: { schemaVersion: 1, tick: toTick, pairs: [] },
     staticTerrain: null,
     waterComponents: null,
-    railTopology: { schemaVersion: 1, tick: toTick, railroads: [] },
+    railTopology: {
+      schemaVersion: 1,
+      tick: toTick,
+      fromTick,
+      toTick,
+      railroads: [],
+      events: []
+    },
     spawnState: {
       schemaVersion: 1,
       tick: toTick,
@@ -42446,7 +42531,14 @@ function resetPassiveBatches(current, tick) {
     trainStops: eventBatch(tick, tick, []),
     attackStats: tickBatch(tick, tick, []),
     staticTerrain: null,
-    waterComponents: null
+    waterComponents: null,
+    railTopology: {
+      ...current.railTopology,
+      tick,
+      fromTick: tick,
+      toTick: tick,
+      events: []
+    }
   };
 }
 function tickBatch(fromTick, toTick, ticks) {
@@ -42548,6 +42640,14 @@ function captureSpawnState(game) {
       reachedTarget: unit.reachedTarget(),
       targetUnitID: unit.targetUnit()?.id() ?? null
     })).sort(byUnitID)
+  };
+}
+function summarizeRailroad(id, tiles) {
+  return {
+    id,
+    startTile: tiles[0] ?? null,
+    endTile: tiles.at(-1) ?? null,
+    tileCount: tiles.length
   };
 }
 function spawnUnit(unit) {
@@ -42743,7 +42843,7 @@ function captureGameState(game, status = "exact") {
     units: units2,
     attacks,
     diplomacy: { alliances },
-    winner: winner === null ? null : "isPlayer" in winner && winner.isPlayer() ? { kind: "player", id: winner.id() } : { kind: "team", id: String(winner.id?.() ?? winner) },
+    winner: winner === null ? null : typeof winner !== "string" && winner.isPlayer() ? { kind: "player", id: winner.id() } : { kind: "team", id: winner },
     tileState,
     rulesRef: ENGINE_IDENTITY,
     source: { mode: "exact", status, hash: "" }
@@ -42929,6 +43029,45 @@ function nonempty(value) {
   const result = String(value ?? "").trim();
   return result ? result : null;
 }
+function deriveTerrainByteLayout() {
+  const bitCount = Uint8Array.BYTES_PER_ELEMENT * 8;
+  const maximumByte = 2 ** bitCount - 1;
+  const bitMasks = Array.from({ length: bitCount }, (_, bit) => 2 ** bit);
+  const probe = (terrainByte) => new GameMapImpl(1, 1, Uint8Array.of(terrainByte), 0);
+  const predicateMask = (predicate) => bitMasks.reduce(
+    (mask, bitMask) => predicate(probe(bitMask)) ? mask | bitMask : mask,
+    0
+  );
+  const landMask = predicateMask((map2) => map2.isLand(0));
+  const oceanMask = predicateMask((map2) => map2.isOcean(0));
+  const shorelineMask = predicateMask((map2) => map2.isShoreline(0));
+  const magnitudeMask = probe(maximumByte).magnitude(0);
+  const landMagnitudeThresholds = [];
+  const landTerrainTypes = [];
+  let previousType = null;
+  for (let magnitude = 0; magnitude <= magnitudeMask; magnitude++) {
+    const terrainType = probe(landMask | magnitude).terrainType(0);
+    if (terrainType === previousType) continue;
+    if (previousType !== null) landMagnitudeThresholds.push(magnitude);
+    landTerrainTypes.push(terrainType);
+    previousType = terrainType;
+  }
+  const waterTerrainTypes = [
+    probe(0).terrainType(0),
+    probe(oceanMask).terrainType(0)
+  ];
+  const typeLegend = [...landTerrainTypes, ...waterTerrainTypes].map(
+    (terrainType) => String(TerrainType[terrainType]).toLowerCase()
+  );
+  return Object.freeze({
+    magnitudeMask,
+    landMask,
+    oceanMask,
+    shorelineMask,
+    landMagnitudeThresholds: Object.freeze(landMagnitudeThresholds),
+    typeLegend: Object.freeze(typeLegend)
+  });
+}
 function defaultMapRoot() {
   return resolve(dirname(fileURLToPath(import.meta.url)), "maps");
 }
@@ -42967,12 +43106,15 @@ async function withSilentEngine(operation) {
   }
 }
 export {
+  CANONICAL_TERRAIN_BYTE_LAYOUT,
   ENGINE_IDENTITY,
   ExactMirror,
   canonicalStateHash,
   captureGameState,
   compareStates,
   encodeStateJSON,
+  mirrorRequestIDForError,
+  parseMirrorRequest,
   replayGameRecord
 };
 /*! Bundled license information:

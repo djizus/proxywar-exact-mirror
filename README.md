@@ -18,11 +18,17 @@ pre-launch routes remain estimates owned by the consuming policy.
 Schema 3 also exposes passive sidecars outside the canonical `GameState`:
 per-tick economy and attack deltas, exact trade/train payout events, constructed
 unit counts, MIRV launches, shared-border edge counts, rail topology, and
-port/trade-ship/train spawn state. Initial terrain and changed water-component
-connectivity use run-length encoding. Initial terrain is emitted once, while
-event batches cover only newly advanced ticks; point-in-time sidecars are
-retained across duplicate or non-state ingests. None of these fields enter the
-canonical state hash.
+port/trade-ship/train spawn state. Rail topology includes compact construction,
+snap, and destruction events in canonical capture order with a match-monotonic
+sequence; the events report segment endpoints and lengths, not duplicate full
+paths. Initial terrain and changed water-component
+connectivity use run-length encoding. The terrain sidecar includes the exact
+byte layout needed to decode magnitude and terrain class without emitting
+duplicate per-tile streams. Initial terrain is emitted once, while event
+batches cover only newly advanced ticks; point-in-time sidecars are retained
+across duplicate or non-state ingests. Private execution-only spawn pity and
+last-spawn ticks are unavailable through the canonical game API and are omitted
+rather than estimated. None of these fields enter the canonical state hash.
 
 Every result carries the immutable Coworld, ProxyWar commit, and game-image
 identity used by the worker. Consumers must verify that identity before using
@@ -39,7 +45,10 @@ more precision than policy decisions consume. Raw state values remain intact.
 
 The worker uses Node IPC with advanced serialization so the normalized
 `GameState.tileState` remains a `Uint16Array`. It never receives player tokens
-or strategy configuration.
+or strategy configuration. Requests are the discriminated `ingest` and
+`finalize` operations and require a non-empty string or non-negative safe
+integer ID. Package declarations expose the request, result, and schema-3
+sidecar types.
 
 ```bash
 git submodule update --init

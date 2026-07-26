@@ -1,7 +1,16 @@
 import assert from "node:assert/strict";
+import { fork } from "node:child_process";
+import { once } from "node:events";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { canonicalStateHash, ENGINE_IDENTITY, ExactMirror, encodeStateJSON } from "../dist/mirror.mjs";
+import {
+  CANONICAL_TERRAIN_BYTE_LAYOUT,
+  canonicalStateHash,
+  ENGINE_IDENTITY,
+  ExactMirror,
+  encodeStateJSON,
+} from "../dist/mirror.mjs";
 
 const names = [
   "Richard Higgins", "James Boggs", "Auri", "docxology", "Ron SWGY", "RelhAlpha",
@@ -20,6 +29,20 @@ const spawnTurns = [
   [1072586, 1208632, 617498, 494334, 1333674, 628394, 994502, 517574, 1080668, 1376618, 249490, 247586],
   [1088580, 1216626, 877134, 659476, 629398, 500334, 628394, 1333674, 1080668, 373314, 673074, 997490],
 ];
+const openingCanonicalHash = "sha256:faa56c5a3791ba09cbc3712aa21a6940c1e07b35312f48ef4e316a2c70e07b42";
+const sidecarNames = [
+  "economyStats",
+  "tradeCompletions",
+  "trainStops",
+  "unitsConstructed",
+  "attackStats",
+  "mirvLaunches",
+  "borderTargets",
+  "staticTerrain",
+  "waterComponents",
+  "railTopology",
+  "spawnState",
+];
 
 test("bootstraps an exact World mirror from the first public snapshot", async () => {
   const mirror = new ExactMirror();
@@ -37,6 +60,7 @@ test("bootstraps an exact World mirror from the first public snapshot", async ()
   assert.equal(result.state.tileState.length, 2_000_000);
   assert.match(result.state.source.hash, /^sha256:[0-9a-f]{64}$/);
   assert.equal(canonicalStateHash(result.state), result.state.source.hash);
+  assert.equal(result.state.source.hash, openingCanonicalHash);
   assert.equal("economyStats" in result.state, false);
   assert.equal(result.economyStats.schemaVersion, 1);
   assert.equal(result.economyStats.toTick, result.state.tick);
@@ -47,14 +71,52 @@ test("bootstraps an exact World mirror from the first public snapshot", async ()
   assert.equal(result.borderTargets.tick, result.state.tick);
   assert.equal(result.staticTerrain.encoding, "uint8-rle");
   assert.equal(result.staticTerrain.length, result.state.tileState.length);
+  assert.deepEqual(
+    result.staticTerrain.byteLayout,
+    CANONICAL_TERRAIN_BYTE_LAYOUT,
+  );
   assert.equal(result.waterComponents.encoding, "int32-rle");
   assert.equal(result.waterComponents.length, result.state.tileState.length);
   assert.equal(result.railTopology.tick, result.state.tick);
+  assert.equal(result.railTopology.fromTick, 0);
+  assert.equal(result.railTopology.toTick, result.state.tick);
+  assert.deepEqual(result.railTopology.events, []);
   assert.equal(result.spawnState.tick, result.state.tick);
 
   const encoded = encodeStateJSON(result.state);
   assert.equal(encoded.tileState.encoding, "uint16-rle");
   assert.equal(encoded.tileState.length, 2_000_000);
+});
+
+test("fixture sidecars are deterministic, exact, and compact outside canonical state", async () => {
+  const leftMirror = new ExactMirror();
+  const rightMirror = new ExactMirror();
+  const [left, right] = await Promise.all([
+    leftMirror.ingest(openingFrame()),
+    rightMirror.ingest(openingFrame()),
+  ]);
+  const leftSidecars = Object.fromEntries(sidecarNames.map((name) => [name, left[name]]));
+  const rightSidecars = Object.fromEntries(sidecarNames.map((name) => [name, right[name]]));
+
+  assert.deepEqual(leftSidecars, rightSidecars);
+  assert.equal(left.state.source.hash, openingCanonicalHash);
+  assert.equal("staticTerrain" in left.state, false);
+  assert.equal("waterComponents" in left.state, false);
+  assert.ok(left.staticTerrain.runs.length < left.staticTerrain.length);
+  assert.ok(left.waterComponents.runs.length < left.waterComponents.length);
+  const serializedBytes = Buffer.byteLength(JSON.stringify(leftSidecars));
+  const rawSidecarBytes =
+    left.staticTerrain.length * Uint8Array.BYTES_PER_ELEMENT +
+    left.waterComponents.length * Int32Array.BYTES_PER_ELEMENT;
+  assert.ok(
+    serializedBytes < rawSidecarBytes,
+    `expected compact sidecars (${serializedBytes} bytes) below raw terrain/connectivity arrays (${rawSidecarBytes} bytes)`,
+  );
+
+  assertTerrainMatchesCanonical(
+    left.staticTerrain,
+    leftMirror.runner.game,
+  );
 });
 
 test("a confirmed global snapshot gap permanently diverges the match", async () => {
@@ -132,26 +194,25 @@ test("canonical hashes ignore cross-runtime last-bit noise in derived floats", a
 test("captures a transport motion plan and terminal event between public snapshots", async () => {
   const mirror = new ExactMirror();
   await mirror.ingest(openingFrame());
-  const expansionDecisions = Array.from({ length: 8 }, (_, wave) =>
-    names.map((username, playerIndex) => ({
-      sequence: 37 + wave * names.length + playerIndex,
-      agentID: `opportunistic-agent-${playerIndex + 1}`,
-      username,
-      turnNumber: 400 + wave * 100,
-      accepted: true,
-      intentSummary: JSON.stringify({
-        type: "attack",
-        targetID: null,
-        troops: 20_000,
-      }),
-    }))
-  ).flat();
+  const expansionDecisions = expansionWaveDecisions();
   const expanded = await mirror.ingest(intervalFrame({
     snapshotCount: 2,
     tick: 1_300,
     decisions: expansionDecisions,
   }));
   assert.equal(expanded.status, "exact");
+  assert.ok(expanded.economyStats.ticks.length > 0);
+  assert.ok(expanded.attackStats.ticks.length > 0);
+  assert.ok(expanded.attackStats.ticks.some((tick) =>
+    tick.players.some((player) => BigInt(player.sent) > 0n)
+  ));
+  assert.ok(expanded.borderTargets.pairs.every((pair) => pair.edges > 0));
+  assert.equal(
+    new Set(expanded.borderTargets.pairs.map((pair) =>
+      `${pair.playerAID}:${pair.playerBID}`
+    )).size,
+    expanded.borderTargets.pairs.length,
+  );
   const boat = findBoatIntent(mirror);
 
   const launchFrame = intervalFrame({
@@ -179,6 +240,9 @@ test("captures a transport motion plan and terminal event between public snapsho
   );
 
   assert.equal(launched.status, "exact");
+  assert.ok(launched.unitsConstructed.players.some((player) =>
+    player.counts.Transport > 0
+  ));
   assert.ok(launch, "expected a transport launch event");
   assert.ok(plan, "expected a transport motion plan");
   assert.ok(plan.pathLength >= 2);
@@ -273,12 +337,123 @@ test("observes exact economy participants and retains point sidecars on no-op in
   assert.deepEqual(repeated.spawnState, observed.spawnState);
   assert.deepEqual(repeated.tradeCompletions.events, []);
   assert.deepEqual(repeated.trainStops.events, []);
+  assert.equal(repeated.staticTerrain, null);
+  assert.equal(repeated.waterComponents, null);
 });
 
-test("same-tick railroad destruction wins over a snap-created segment", () => {
-  const observer = new ExactMirror().passiveSidecars;
+test("captures non-empty port, trade ship, and train spawn state exactly", async () => {
+  const mirror = new ExactMirror();
+  await mirror.ingest(openingFrame());
+  const expansionDecisions = expansionWaveDecisions();
+  await mirror.ingest(intervalFrame({
+    snapshotCount: 2,
+    tick: 1_300,
+    decisions: expansionDecisions,
+  }));
+  const game = mirror.runner.game;
+  for (const player of game.players()) player.addGold(1_000_000n);
+  const portCandidates = game.players()
+    .map((player) => ({ player, tile: findPortTile(game, player) }))
+    .filter((candidate) => candidate.tile !== null);
+  assert.ok(
+    portCandidates.length >= 2,
+    "expanded fixture needs two coastal port sites",
+  );
+  const [{ player: source, tile: sourcePortTile }, {
+    player: destination,
+    tile: destinationPortTile,
+  }] = portCandidates;
+  const sourcePort = source.buildUnit("Port", sourcePortTile, {});
+  const destinationPort = destination.buildUnit("Port", destinationPortTile, {});
+  const tradeShipTile = game.neighbors(sourcePortTile)
+    .find((tile) => game.isWater(tile));
+  assert.notEqual(tradeShipTile, undefined, "fixture port needs adjacent water");
+  const tradeShip = source.buildUnit("Trade Ship", tradeShipTile, {
+    targetUnit: destinationPort,
+  });
+  const train = source.buildUnit("Train", sourcePortTile, {
+    trainType: "Engine",
+    targetUnit: destinationPort,
+    loaded: true,
+  });
+
+  const observed = await mirror.ingest(intervalFrame({
+    snapshotCount: 3,
+    tick: 1_300,
+    decisions: [],
+  }));
+
+  assert.deepEqual(
+    observed.spawnState.ports.map((unit) => unit.unitID),
+    [sourcePort.id(), destinationPort.id()],
+  );
+  assert.deepEqual(observed.spawnState.tradeShips, [{
+    unitID: tradeShip.id(),
+    ownerPlayerID: String(source.id()),
+    tile: tradeShipTile,
+    level: 1,
+    active: true,
+    underConstruction: false,
+    hasTrainStation: false,
+    targetUnitID: destinationPort.id(),
+    targetOwnerPlayerID: String(destination.id()),
+  }]);
+  assert.deepEqual(observed.spawnState.trains, [{
+    unitID: train.id(),
+    ownerPlayerID: String(source.id()),
+    tile: sourcePortTile,
+    level: 1,
+    active: true,
+    underConstruction: false,
+    hasTrainStation: false,
+    trainType: "Engine",
+    loaded: true,
+    reachedTarget: false,
+    targetUnitID: destinationPort.id(),
+  }]);
+});
+
+test("emits changed water components after a canonical water graph rebuild", async () => {
+  const mirror = new ExactMirror();
+  const opening = await mirror.ingest(openingFrame());
+  const game = mirror.runner.game;
+  const convertedTiles = findWaterConversionTiles(game);
+  assert.ok(
+    convertedTiles.length >= 3,
+    "fixture needs three unowned land tiles in one minimap cell",
+  );
+  game.config().gameConfig().waterNukes = true;
+  for (const tile of convertedTiles) game.queueWaterConversion(tile);
+
+  const observed = await mirror.ingest(intervalFrame({
+    snapshotCount: 2,
+    tick: 401,
+    decisions: [],
+  }));
+
+  assert.equal(observed.status, "exact");
+  assert.ok(convertedTiles.every((tile) => game.isWater(tile)));
+  assert.ok(
+    observed.waterComponents.graphVersion >
+      opening.waterComponents.graphVersion,
+  );
+  assert.equal(
+    rleValueAt(observed.waterComponents.runs, convertedTiles[0]),
+    game.getWaterComponent(convertedTiles[0]) ?? -1,
+  );
+});
+
+test("same-tick railroad destruction wins over a snap-created segment in the emitted batch", async () => {
+  const mirror = new ExactMirror();
+  await mirror.ingest(openingFrame());
+  const observer = mirror.passiveSidecars;
+  observer.beginBatch(400);
   observer.railroads.set(1, [9]);
   const updates = Array.from({ length: 23 }, () => []);
+  updates[17].push({
+    id: 20,
+    tiles: [20, 21, 22],
+  });
   updates[18].push({
     originalId: 1,
     newId1: 2,
@@ -289,14 +464,198 @@ test("same-tick railroad destruction wins over a snap-created segment", () => {
   updates[16].push({ id: 2 });
 
   observer.captureRunnerUpdate({
-    tick: 1,
+    tick: 401,
     updates,
     packedTileUpdates: new Uint32Array(),
     playerNameViewData: {},
   });
 
-  assert.deepEqual([...observer.railroads], [[3, [11]]]);
+  const emitted = observer.endBatch(mirror.runner.game, 401).railTopology;
+  assert.deepEqual(emitted.railroads, [
+    { id: 3, tiles: [11] },
+    { id: 20, tiles: [20, 21, 22] },
+  ]);
+  assert.deepEqual(emitted.events, [
+    {
+      sequence: 1,
+      tick: 401,
+      type: "constructed",
+      railroad: { id: 20, startTile: 20, endTile: 22, tileCount: 3 },
+    },
+    {
+      sequence: 2,
+      tick: 401,
+      type: "snapped",
+      originalRailroadID: 1,
+      railroads: [
+        { id: 2, startTile: 10, endTile: 10, tileCount: 1 },
+        { id: 3, startTile: 11, endTile: 11, tileCount: 1 },
+      ],
+    },
+    {
+      sequence: 3,
+      tick: 401,
+      type: "destroyed",
+      railroadID: 2,
+    },
+  ]);
+  assert.equal("tiles" in emitted.events[1].railroads[0], false);
+
+  observer.beginBatch(401);
+  const nextUpdates = Array.from({ length: 23 }, () => []);
+  nextUpdates[17].push({ id: 21, tiles: [30, 31] });
+  observer.captureRunnerUpdate({
+    tick: 402,
+    updates: nextUpdates,
+    packedTileUpdates: new Uint32Array(),
+    playerNameViewData: {},
+  });
+  const nextBatch = observer.endBatch(mirror.runner.game, 402).railTopology;
+  assert.equal(nextBatch.events[0].sequence, 4);
 });
+
+test("worker validates operation and request IDs while retaining numeric requests", async () => {
+  const worker = fork(
+    fileURLToPath(new URL("../dist/worker.mjs", import.meta.url)),
+    [],
+    {
+      serialization: "advanced",
+      stdio: ["ignore", "ignore", "pipe", "ipc"],
+    },
+  );
+  try {
+    const backward = await workerRequest(worker, {
+      id: 7,
+      type: "ingest",
+      frame: openingFrame(),
+    });
+    assert.equal(backward.id, 7);
+    assert.equal(backward.ok, true);
+    assert.equal(backward.result.status, "exact");
+    assert.ok(backward.result.state.tileState instanceof Uint16Array);
+    assert.equal(backward.result.state.source.hash, openingCanonicalHash);
+
+    const invalidOperation = await workerRequest(worker, {
+      id: "invalid-operation",
+      type: "inspect",
+    });
+    assert.deepEqual(
+      { id: invalidOperation.id, ok: invalidOperation.ok },
+      { id: "invalid-operation", ok: false },
+    );
+    assert.match(invalidOperation.error, /expected ingest or finalize/);
+
+    const invalidID = await workerRequest(worker, {
+      id: { nested: true },
+      type: "ingest",
+      frame: null,
+    });
+    assert.equal(invalidID.id, null);
+    assert.equal(invalidID.ok, false);
+    assert.match(invalidID.error, /request id must be/);
+  } finally {
+    worker.kill("SIGTERM");
+    if (worker.exitCode === null) await once(worker, "exit");
+  }
+});
+
+function assertTerrainMatchesCanonical(sidecar, game) {
+  const layout = sidecar.byteLayout;
+  let tile = 0;
+  for (const [raw, length] of sidecar.runs) {
+    assert.ok(
+      Number.isInteger(raw) && raw >= 0 && raw <= 255,
+      `invalid uint8 terrain value ${raw}`,
+    );
+    for (let offset = 0; offset < length; offset++, tile++) {
+      if (
+        raw !== game.terrainByte(tile) ||
+        Boolean(raw & layout.landMask) !== game.isLand(tile) ||
+        Boolean(raw & layout.oceanMask) !== game.isOcean(tile) ||
+        Boolean(raw & layout.shorelineMask) !== game.isShoreline(tile) ||
+        (raw & layout.magnitudeMask) !== game.magnitude(tile)
+      ) {
+        assert.fail(`terrain metadata disagrees with canonical GameMap at tile ${tile}`);
+      }
+    }
+  }
+  assert.equal(tile, sidecar.length);
+}
+
+function findPortTile(game, player) {
+  for (const tile of player.tiles()) {
+    if (
+      game.isLand(tile) &&
+      game.isShoreline(tile) &&
+      game.neighbors(tile).some((neighbor) => game.isWater(neighbor))
+    ) {
+      return tile;
+    }
+  }
+  return null;
+}
+
+function findWaterConversionTiles(game) {
+  for (let y = 0; y < game.height(); y += 2) {
+    for (let x = 0; x < game.width(); x += 2) {
+      const tiles = [];
+      for (let dy = 0; dy < 2; dy++) {
+        for (let dx = 0; dx < 2; dx++) {
+          if (!game.isValidCoord(x + dx, y + dy)) continue;
+          const tile = game.ref(x + dx, y + dy);
+          if (game.isLand(tile) && !game.hasOwner(tile)) tiles.push(tile);
+        }
+      }
+      if (tiles.length >= 3) return tiles;
+    }
+  }
+  return [];
+}
+
+function expansionWaveDecisions() {
+  return Array.from({ length: 8 }, (_, wave) =>
+    names.map((username, playerIndex) => ({
+      sequence: 37 + wave * names.length + playerIndex,
+      agentID: `opportunistic-agent-${playerIndex + 1}`,
+      username,
+      turnNumber: 400 + wave * 100,
+      accepted: true,
+      intentSummary: JSON.stringify({
+        type: "attack",
+        targetID: null,
+        troops: 20_000,
+      }),
+    }))
+  ).flat();
+}
+
+function workerRequest(worker, message) {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      worker.off("message", onMessage);
+      worker.off("error", onError);
+      worker.off("exit", onExit);
+    };
+    const onMessage = (response) => {
+      cleanup();
+      resolve(response);
+    };
+    const onError = (error) => {
+      cleanup();
+      reject(error);
+    };
+    const onExit = (code, signal) => {
+      cleanup();
+      reject(new Error(`mirror worker exited code=${code} signal=${signal}`));
+    };
+    worker.once("message", onMessage);
+    worker.once("error", onError);
+    worker.once("exit", onExit);
+    worker.send(message, (error) => {
+      if (error) onError(error);
+    });
+  });
+}
 
 function findBoatIntent(mirror) {
   const runner = mirror.runner;
@@ -340,6 +699,15 @@ function intervalFrame({ snapshotCount, tick, decisions }) {
   frame.snapshot.players = [];
   frame.snapshot.decisions = decisions;
   return frame;
+}
+
+function rleValueAt(runs, target) {
+  let offset = 0;
+  for (const [value, length] of runs) {
+    if (target < offset + length) return value;
+    offset += length;
+  }
+  throw new Error(`RLE index ${target} exceeds decoded length ${offset}`);
 }
 
 function openingFrame() {
