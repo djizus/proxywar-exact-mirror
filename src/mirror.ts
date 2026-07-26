@@ -10,10 +10,12 @@ import {
   GameMapType,
   GameMode,
   GameType,
+  TerrainType,
   UnitType,
   type Game,
   type Unit,
 } from "../vendor/proxywar/src/core/game/Game.ts";
+import { GameMapImpl } from "../vendor/proxywar/src/core/game/GameMap.ts";
 import type { GameMapLoader } from "../vendor/proxywar/src/core/game/GameMapLoader.ts";
 import type {
   ErrorUpdate,
@@ -36,6 +38,33 @@ import {
   GOLD_INDEX_WAR,
   GOLD_INDEX_WORK,
 } from "../vendor/proxywar/src/core/StatsSchemas.ts";
+import type {
+  AttackPlayerDelta,
+  BorderTargetsSidecar,
+  EconomyPlayerDelta,
+  EventBatch,
+  GameState,
+  MirrorFinalizeResult,
+  MirrorIngestResult,
+  MirrorStatus,
+  ParityResult,
+  PassiveSidecars,
+  RailLifecycleEvent,
+  RailroadSummary,
+  SpawnStateSidecar,
+  SpawnUnitState,
+  StaticTerrainSidecar,
+  TerrainByteLayout,
+  TickBatch,
+  TradeCompletionEvent,
+  TrainStopEvent,
+  TransportLifecycleBatch,
+  TransportLifecycleEvent,
+  UnitsConstructedSidecar,
+  WaterComponentsSidecar,
+} from "./protocol.ts";
+
+export * from "./protocol.ts";
 
 process.env.GAME_ENV ??= "dev";
 
@@ -46,76 +75,9 @@ export const ENGINE_IDENTITY = Object.freeze({
   gameImage: "public.ecr.aws/q5f4m8t9/cogames@sha256:71341d0c0b701dc13f0e8afc45b05c2fed94e8cdad8579c0d4b0745de9441d70",
 });
 
+export const CANONICAL_TERRAIN_BYTE_LAYOUT = deriveTerrainByteLayout();
+
 const HASH_SIGNIFICANT_DIGITS = 11;
-
-export type MirrorStatus = "bootstrapping" | "exact" | "lagging" | "diverged" | "unavailable";
-
-export type GameState = {
-  schemaVersion: 1;
-  tick: number;
-  phase: "spawn" | "active" | "finished";
-  map: {
-    name: string;
-    size: string;
-    width: number;
-    height: number;
-    landTiles: number;
-    falloutTiles: number;
-  };
-  players: Array<Record<string, unknown>>;
-  units: Array<Record<string, unknown>>;
-  attacks: Array<Record<string, unknown>>;
-  diplomacy: { alliances: Array<Record<string, unknown>> };
-  winner: { kind: "player" | "team"; id: string | number } | null;
-  tileState: Uint16Array;
-  rulesRef: typeof ENGINE_IDENTITY;
-  source: { mode: "exact"; status: MirrorStatus; hash: string };
-};
-
-export type ParityResult = {
-  ok: boolean;
-  checked: string[];
-  mismatches: Array<{ path: string; expected: unknown; actual: unknown }>;
-};
-
-export type TransportLifecycleEvent = {
-  eventID: string;
-  type:
-    | "launch_observed"
-    | "launch_failed"
-    | "plan_updated"
-    | "retreat_started"
-    | "arrived"
-    | "attack_converted"
-    | "friendly_returned"
-    | "retreat_returned"
-    | "destroyed"
-    | "path_failed";
-  tick: number;
-  unitID: number | null;
-  ownerPlayerID: string | null;
-  targetPlayerID: string | null;
-  sourceTile?: number | null;
-  currentTile?: number | null;
-  requestedTile?: number | null;
-  targetTile?: number | null;
-  troops?: number;
-  planID?: number;
-  pathLength?: number;
-  ticksPerStep?: number;
-  projectedCompletionTick?: number;
-  attackID?: string;
-  destroyerPlayerID?: string | null;
-  terminalOwnerClass?: "self" | "friendly" | "hostile" | "neutral";
-  terminalOwnerSmallID?: number | null;
-};
-
-export type TransportLifecycleBatch = {
-  schemaVersion: 1;
-  fromTick: number;
-  toTick: number;
-  events: TransportLifecycleEvent[];
-};
 
 type TrackedTransport = {
   unitID: number;
@@ -155,19 +117,8 @@ type SidecarTickSnapshot = {
   stats: StatsSnapshot;
 };
 
-type PassiveSidecars = {
-  economyStats: Record<string, unknown>;
-  tradeCompletions: Record<string, unknown>;
-  trainStops: Record<string, unknown>;
-  unitsConstructed: Record<string, unknown>;
-  attackStats: Record<string, unknown>;
-  mirvLaunches: Record<string, unknown>;
-  borderTargets: Record<string, unknown>;
-  staticTerrain: Record<string, unknown> | null;
-  waterComponents: Record<string, unknown> | null;
-  railTopology: Record<string, unknown>;
-  spawnState: Record<string, unknown>;
-};
+type WithoutTick<T> = T extends unknown ? Omit<T, "tick"> : never;
+type WithoutSequence<T> = T extends unknown ? Omit<T, "sequence"> : never;
 
 export class ExactMirror {
   private runner: GameRunner | null = null;
@@ -188,7 +139,7 @@ export class ExactMirror {
     this.mapLoader = new StaticMapLoader(options.mapRoot ?? defaultMapRoot());
   }
 
-  async ingest(frame: unknown): Promise<Record<string, unknown>> {
+  async ingest(frame: unknown): Promise<MirrorIngestResult> {
     const currentTick = this.runner?.game.ticks() ?? 0;
     this.latestTransportBatch = emptyTransportBatch(currentTick, currentTick);
     this.latestSidecars = resetPassiveBatches(this.latestSidecars, currentTick);
@@ -229,7 +180,7 @@ export class ExactMirror {
     }
   }
 
-  async finalize(gameRecord: unknown): Promise<Record<string, unknown>> {
+  async finalize(gameRecord: unknown): Promise<MirrorFinalizeResult> {
     const official = await replayGameRecord(gameRecord, { mapLoader: this.mapLoader });
     const parity = this.latestState === null
       ? { ok: false, checked: [], mismatches: [{ path: "mirror", expected: "state", actual: null }] }
@@ -336,7 +287,10 @@ export class ExactMirror {
     }
   }
 
-  private diverge(reason: string, detail: Record<string, unknown>): Record<string, unknown> {
+  private diverge(
+    reason: string,
+    detail: Record<string, unknown>,
+  ): MirrorIngestResult {
     this.status = "diverged";
     if (this.latestState) this.latestState.source.status = "diverged";
     this.incident = {
@@ -351,7 +305,7 @@ export class ExactMirror {
     return this.result(null);
   }
 
-  private result(parity: ParityResult | null): Record<string, unknown> {
+  private result(parity: ParityResult | null): MirrorIngestResult {
     return {
       schemaVersion: 3,
       status: this.status,
@@ -604,18 +558,20 @@ class TransportLifecycleObserver {
 
 class PassiveSidecarObserver {
   private fromTick = 0;
-  private economyTicks: Array<Record<string, unknown>> = [];
-  private attackTicks: Array<Record<string, unknown>> = [];
-  private tradeEvents: Array<Record<string, unknown>> = [];
-  private trainEvents: Array<Record<string, unknown>> = [];
-  private pendingTradeEvents: Array<Record<string, unknown>> = [];
-  private pendingTrainEvents: Array<Record<string, unknown>> = [];
+  private economyTicks: TickBatch<EconomyPlayerDelta>["ticks"] = [];
+  private attackTicks: TickBatch<AttackPlayerDelta>["ticks"] = [];
+  private tradeEvents: TradeCompletionEvent[] = [];
+  private trainEvents: TrainStopEvent[] = [];
+  private pendingTradeEvents: Array<WithoutTick<TradeCompletionEvent>> = [];
+  private pendingTrainEvents: Array<WithoutTick<TrainStopEvent>> = [];
   private pendingExternalTrainStops: Array<{
     payout: string;
     stationOwnerPlayerID: string;
   }> = [];
   private railroads = new Map<number, number[]>();
-  private initialTerrain: Record<string, unknown> | null = null;
+  private railEvents: RailLifecycleEvent[] = [];
+  private nextRailEventSequence = 1;
+  private initialTerrain: StaticTerrainSidecar | null = null;
   private emitInitialTerrain = false;
   private waterGraphVersion: number | null = null;
 
@@ -631,6 +587,7 @@ class PassiveSidecarObserver {
       encoding: "uint8-rle",
       length: terrain.length,
       runs: encodeIntegerRuns(terrain),
+      byteLayout: CANONICAL_TERRAIN_BYTE_LAYOUT,
     };
     this.emitInitialTerrain = true;
     this.attachStatsHooks(game);
@@ -642,22 +599,42 @@ class PassiveSidecarObserver {
     this.attackTicks = [];
     this.tradeEvents = [];
     this.trainEvents = [];
+    this.railEvents = [];
   }
 
   captureRunnerUpdate(update: GameUpdateViewData | ErrorUpdate): void {
     if (!("tick" in update)) return;
     for (const entry of update.updates[GameUpdateType.RailroadConstructionEvent] ?? []) {
       this.railroads.set(entry.id, [...entry.tiles]);
+      this.emitRailEvent({
+        tick: update.tick,
+        type: "constructed",
+        railroad: summarizeRailroad(entry.id, entry.tiles),
+      });
     }
     for (const entry of update.updates[GameUpdateType.RailroadSnapEvent] ?? []) {
       this.railroads.delete(entry.originalId);
       this.railroads.set(entry.newId1, [...entry.tiles1]);
       this.railroads.set(entry.newId2, [...entry.tiles2]);
+      this.emitRailEvent({
+        tick: update.tick,
+        type: "snapped",
+        originalRailroadID: entry.originalId,
+        railroads: [
+          summarizeRailroad(entry.newId1, entry.tiles1),
+          summarizeRailroad(entry.newId2, entry.tiles2),
+        ],
+      });
     }
     // A newly snapped segment can be destroyed later in the same canonical
     // tick, so destruction must win when grouped update types are reconciled.
     for (const entry of update.updates[GameUpdateType.RailroadDestructionEvent] ?? []) {
       this.railroads.delete(entry.id);
+      this.emitRailEvent({
+        tick: update.tick,
+        type: "destroyed",
+        railroadID: entry.id,
+      });
     }
   }
 
@@ -668,8 +645,8 @@ class PassiveSidecarObserver {
   afterTick(game: Game, before: SidecarTickSnapshot): void {
     const tick = game.ticks();
     const after = statsSnapshot(game);
-    const economyPlayers: Array<Record<string, unknown>> = [];
-    const attackPlayers: Array<Record<string, unknown>> = [];
+    const economyPlayers: EconomyPlayerDelta[] = [];
+    const attackPlayers: AttackPlayerDelta[] = [];
 
     for (const player of game.allPlayers().filter((entry) => entry.isPlayer())) {
       const playerID = String(player.id());
@@ -738,12 +715,24 @@ class PassiveSidecarObserver {
       railTopology: {
         schemaVersion: 1,
         tick: toTick,
+        fromTick: this.fromTick,
+        toTick,
         railroads: [...this.railroads]
           .sort(([left], [right]) => left - right)
           .map(([id, tiles]) => ({ id, tiles: [...tiles] })),
+        events: [...this.railEvents],
       },
       spawnState: captureSpawnState(game),
     };
+  }
+
+  private emitRailEvent(
+    event: WithoutSequence<RailLifecycleEvent>,
+  ): void {
+    this.railEvents.push({
+      sequence: this.nextRailEventSequence++,
+      ...event,
+    } as RailLifecycleEvent);
   }
 
   private attachStatsHooks(game: Game): void {
@@ -834,7 +823,14 @@ function emptyPassiveSidecars(
     borderTargets: { schemaVersion: 1, tick: toTick, pairs: [] },
     staticTerrain: null,
     waterComponents: null,
-    railTopology: { schemaVersion: 1, tick: toTick, railroads: [] },
+    railTopology: {
+      schemaVersion: 1,
+      tick: toTick,
+      fromTick,
+      toTick,
+      railroads: [],
+      events: [],
+    },
     spawnState: {
       schemaVersion: 1,
       tick: toTick,
@@ -857,22 +853,29 @@ function resetPassiveBatches(
     attackStats: tickBatch(tick, tick, []),
     staticTerrain: null,
     waterComponents: null,
+    railTopology: {
+      ...current.railTopology,
+      tick,
+      fromTick: tick,
+      toTick: tick,
+      events: [],
+    },
   };
 }
 
-function tickBatch(
+function tickBatch<T>(
   fromTick: number,
   toTick: number,
-  ticks: Array<Record<string, unknown>>,
-): Record<string, unknown> {
+  ticks: TickBatch<T>["ticks"],
+): TickBatch<T> {
   return { schemaVersion: 1, fromTick, toTick, ticks };
 }
 
-function eventBatch(
+function eventBatch<T>(
   fromTick: number,
   toTick: number,
-  events: Array<Record<string, unknown>>,
-): Record<string, unknown> {
+  events: T[],
+): EventBatch<T> {
   return { schemaVersion: 1, fromTick, toTick, events };
 }
 
@@ -906,7 +909,7 @@ function deltaAt(
   return ((current[index] ?? 0n) - (previous?.[index] ?? 0n)).toString();
 }
 
-function captureUnitsConstructed(game: Game): Record<string, unknown> {
+function captureUnitsConstructed(game: Game): UnitsConstructedSidecar {
   const types = Object.values(UnitType).sort();
   return {
     schemaVersion: 1,
@@ -924,7 +927,7 @@ function captureUnitsConstructed(game: Game): Record<string, unknown> {
   };
 }
 
-function captureBorderTargets(game: Game): Record<string, unknown> {
+function captureBorderTargets(game: Game): BorderTargetsSidecar {
   const counts = new Map<string, {
     playerAID: string;
     playerBID: string;
@@ -961,7 +964,7 @@ function captureBorderTargets(game: Game): Record<string, unknown> {
 function captureWaterComponents(
   game: Game,
   graphVersion: number,
-): Record<string, unknown> {
+): WaterComponentsSidecar {
   const components = new Array<number>(game.width() * game.height());
   for (let tile = 0; tile < components.length; tile++) {
     components[tile] = game.isWater(tile)
@@ -978,8 +981,12 @@ function captureWaterComponents(
   };
 }
 
-function captureSpawnState(game: Game): Record<string, unknown> {
+function captureSpawnState(game: Game): SpawnStateSidecar {
   const units = game.units();
+  // Availability basis: the canonical Game/Unit APIs expose current ports,
+  // trade ships, and trains, but not PortExecution's private spawn-rejection
+  // pity or TrainStationExecution's private lastSpawnTick. They are omitted
+  // here rather than reconstructed or estimated.
   return {
     schemaVersion: 1,
     tick: game.ticks(),
@@ -1005,7 +1012,19 @@ function captureSpawnState(game: Game): Record<string, unknown> {
   };
 }
 
-function spawnUnit(unit: Unit): Record<string, unknown> {
+function summarizeRailroad(
+  id: number,
+  tiles: number[],
+): RailroadSummary {
+  return {
+    id,
+    startTile: tiles[0] ?? null,
+    endTile: tiles.at(-1) ?? null,
+    tileCount: tiles.length,
+  };
+}
+
+function spawnUnit(unit: Unit): SpawnUnitState {
   return {
     unitID: unit.id(),
     ownerPlayerID: identifier(unit.owner().id()),
@@ -1247,9 +1266,9 @@ export function captureGameState(game: Game, status: MirrorStatus = "exact"): Ga
     units,
     attacks,
     diplomacy: { alliances },
-    winner: winner === null ? null : "isPlayer" in winner && winner.isPlayer()
+    winner: winner === null ? null : typeof winner !== "string" && winner.isPlayer()
       ? { kind: "player" as const, id: winner.id() }
-      : { kind: "team" as const, id: String((winner as { id?: () => unknown }).id?.() ?? winner) },
+      : { kind: "team" as const, id: winner },
     tileState,
     rulesRef: ENGINE_IDENTITY,
     source: { mode: "exact" as const, status, hash: "" },
@@ -1281,7 +1300,9 @@ export function compareStates(left: GameState, right: GameState): ParityResult {
   return { ok: mismatches.length === 0, checked, mismatches };
 }
 
-function stateRef(state: GameState | null): Record<string, unknown> | null {
+function stateRef(
+  state: GameState | null,
+): { tick: number; status: MirrorStatus; hash: string } | null {
   if (state === null) return null;
   return { tick: state.tick, status: state.source.status, hash: state.source.hash };
 }
@@ -1437,6 +1458,50 @@ function rememberIdentity(map: Map<string, string>, key: string | null, clientID
 function nonempty(value: unknown): string | null {
   const result = String(value ?? "").trim();
   return result ? result : null;
+}
+function deriveTerrainByteLayout(): Readonly<TerrainByteLayout> {
+  const bitCount = Uint8Array.BYTES_PER_ELEMENT * 8;
+  const maximumByte = (2 ** bitCount) - 1;
+  const bitMasks = Array.from({ length: bitCount }, (_, bit) => 2 ** bit);
+  const probe = (terrainByte: number): GameMapImpl =>
+    new GameMapImpl(1, 1, Uint8Array.of(terrainByte), 0);
+  const predicateMask = (
+    predicate: (map: GameMapImpl) => boolean,
+  ): number => bitMasks.reduce(
+    (mask, bitMask) => predicate(probe(bitMask)) ? mask | bitMask : mask,
+    0,
+  );
+
+  const landMask = predicateMask((map) => map.isLand(0));
+  const oceanMask = predicateMask((map) => map.isOcean(0));
+  const shorelineMask = predicateMask((map) => map.isShoreline(0));
+  const magnitudeMask = probe(maximumByte).magnitude(0);
+  const landMagnitudeThresholds: number[] = [];
+  const landTerrainTypes: TerrainType[] = [];
+  let previousType: TerrainType | null = null;
+  for (let magnitude = 0; magnitude <= magnitudeMask; magnitude++) {
+    const terrainType = probe(landMask | magnitude).terrainType(0);
+    if (terrainType === previousType) continue;
+    if (previousType !== null) landMagnitudeThresholds.push(magnitude);
+    landTerrainTypes.push(terrainType);
+    previousType = terrainType;
+  }
+  const waterTerrainTypes = [
+    probe(0).terrainType(0),
+    probe(oceanMask).terrainType(0),
+  ];
+  const typeLegend = [...landTerrainTypes, ...waterTerrainTypes].map(
+    (terrainType) => String(TerrainType[terrainType]).toLowerCase(),
+  );
+
+  return Object.freeze({
+    magnitudeMask,
+    landMask,
+    oceanMask,
+    shorelineMask,
+    landMagnitudeThresholds: Object.freeze(landMagnitudeThresholds),
+    typeLegend: Object.freeze(typeLegend),
+  });
 }
 function defaultMapRoot(): string { return resolve(dirname(fileURLToPath(import.meta.url)), "maps"); }
 function enumValue<T extends Record<string, string>>(values: T, value: unknown): T[keyof T] {

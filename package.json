@@ -9,8 +9,13 @@
     "LICENSE",
     "README.md"
   ],
+  "types": "./dist/mirror.d.mts",
   "exports": {
-    ".": "./dist/mirror.mjs"
+    ".": {
+      "types": "./dist/mirror.d.mts",
+      "import": "./dist/mirror.mjs",
+      "default": "./dist/mirror.mjs"
+    }
   },
   "bin": {
     "proxywar-exact-mirror": "./dist/worker.mjs"
