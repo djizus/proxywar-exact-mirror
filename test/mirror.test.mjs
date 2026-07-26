@@ -26,6 +26,7 @@ test("bootstraps an exact World mirror from the first public snapshot", async ()
   const result = await mirror.ingest(openingFrame());
 
   assert.equal(result.status, "exact");
+  assert.equal(result.schemaVersion, 3);
   assert.deepEqual(result.engine, ENGINE_IDENTITY);
   assert.equal(result.parity.ok, true);
   assert.equal(result.state.tick, 400);
@@ -35,6 +36,21 @@ test("bootstraps an exact World mirror from the first public snapshot", async ()
   assert.ok(result.state.players.every((player) => player.maxTroops > 0));
   assert.equal(result.state.tileState.length, 2_000_000);
   assert.match(result.state.source.hash, /^sha256:[0-9a-f]{64}$/);
+  assert.equal(canonicalStateHash(result.state), result.state.source.hash);
+  assert.equal("economyStats" in result.state, false);
+  assert.equal(result.economyStats.schemaVersion, 1);
+  assert.equal(result.economyStats.toTick, result.state.tick);
+  assert.equal(result.unitsConstructed.tick, result.state.tick);
+  assert.equal(result.unitsConstructed.players.length, 12);
+  assert.equal(result.attackStats.toTick, result.state.tick);
+  assert.equal(result.mirvLaunches.count, "0");
+  assert.equal(result.borderTargets.tick, result.state.tick);
+  assert.equal(result.staticTerrain.encoding, "uint8-rle");
+  assert.equal(result.staticTerrain.length, result.state.tileState.length);
+  assert.equal(result.waterComponents.encoding, "int32-rle");
+  assert.equal(result.waterComponents.length, result.state.tileState.length);
+  assert.equal(result.railTopology.tick, result.state.tick);
+  assert.equal(result.spawnState.tick, result.state.tick);
 
   const encoded = encodeStateJSON(result.state);
   assert.equal(encoded.tileState.encoding, "uint16-rle");
@@ -182,6 +198,10 @@ test("captures a transport motion plan and terminal event between public snapsho
   assert.equal(completed.status, "exact");
   assert.ok(terminal, "expected an exact terminal transport event");
   assert.equal(terminal.type, "arrived");
+  assert.ok(
+    ["self", "friendly", "hostile", "neutral"].includes(terminal.terminalOwnerClass),
+  );
+  assert.ok(Number.isInteger(terminal.terminalOwnerSmallID));
   assert.ok(
     completed.transportLifecycle.events.some(
       (event) =>
