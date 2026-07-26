@@ -41866,7 +41866,7 @@ var ExactMirror = class {
   async ingest(frame) {
     const currentTick = this.runner?.game.ticks() ?? 0;
     this.latestTransportBatch = emptyTransportBatch(currentTick, currentTick);
-    this.latestSidecars = emptyPassiveSidecars(currentTick, currentTick);
+    this.latestSidecars = resetPassiveBatches(this.latestSidecars, currentTick);
     if (this.status === "diverged" || this.status === "unavailable") {
       return this.result(null);
     }
@@ -42231,6 +42231,9 @@ var PassiveSidecarObserver = class {
   attackTicks = [];
   tradeEvents = [];
   trainEvents = [];
+  pendingTradeEvents = [];
+  pendingTrainEvents = [];
+  pendingExternalTrainStops = [];
   railroads = /* @__PURE__ */ new Map();
   initialTerrain = null;
   emitInitialTerrain = false;
@@ -42249,6 +42252,7 @@ var PassiveSidecarObserver = class {
       runs: encodeIntegerRuns(terrain)
     };
     this.emitInitialTerrain = true;
+    this.attachStatsHooks(game);
   }
   beginBatch(fromTick) {
     this.fromTick = fromTick;
@@ -42279,7 +42283,7 @@ var PassiveSidecarObserver = class {
     const after = statsSnapshot(game);
     const economyPlayers = [];
     const attackPlayers = [];
-    for (const player of game.players().filter((entry) => entry.isPlayer())) {
+    for (const player of game.allPlayers().filter((entry) => entry.isPlayer())) {
       const playerID = String(player.id());
       const prior = before.stats.get(playerID);
       const current = after.get(playerID);
@@ -42314,11 +42318,11 @@ var PassiveSidecarObserver = class {
     }
     if (economyPlayers.length > 0) {
       this.economyTicks.push({ tick, players: economyPlayers });
-      this.captureEconomyCompletions(tick, economyPlayers);
     }
     if (attackPlayers.length > 0) {
       this.attackTicks.push({ tick, players: attackPlayers });
     }
+    this.flushObservedEvents(tick);
   }
   endBatch(game, toTick) {
     const staticTerrain = this.emitInitialTerrain ? this.initialTerrain : null;
@@ -42348,45 +42352,65 @@ var PassiveSidecarObserver = class {
       spawnState: captureSpawnState(game)
     };
   }
-  captureEconomyCompletions(tick, players) {
-    const byTradePayout = /* @__PURE__ */ new Map();
-    const byTrainSelf = /* @__PURE__ */ new Map();
-    const byTrainOther = /* @__PURE__ */ new Map();
-    for (const player of players) {
-      const playerID = String(player.playerID);
-      addPayout(byTradePayout, String(player.trade), playerID);
-      addPayout(byTradePayout, String(player.steal), playerID);
-      addPayout(byTrainSelf, String(player.trainSelf), playerID);
-      addPayout(byTrainOther, String(player.trainOther), playerID);
-    }
-    for (const [payout, recipients] of byTradePayout) {
-      if (recipients.length === 2) {
-        this.tradeEvents.push({
-          tick,
-          payout,
-          sourceRecipientPlayerID: recipients[0],
-          destinationRecipientPlayerID: recipients[1],
-          provenance: "exact_stats_delta"
-        });
-      } else if (recipients.length === 1) {
-        this.tradeEvents.push({
-          tick,
-          payout,
-          capturedRecipientPlayerID: recipients[0],
-          provenance: "exact_stats_delta"
-        });
-      }
-    }
-    for (const [payout, trainOwners] of byTrainSelf) {
-      const stationOwners = byTrainOther.get(payout) ?? [];
-      if (trainOwners.length !== 1 || stationOwners.length > 1) continue;
-      this.trainEvents.push({
-        tick,
-        payout,
-        trainOwnerPlayerID: trainOwners[0],
-        stationOwnerPlayerID: stationOwners[0] ?? trainOwners[0],
-        provenance: "exact_stats_delta"
+  attachStatsHooks(game) {
+    const stats = game.stats();
+    const boatArriveTrade = stats.boatArriveTrade.bind(stats);
+    stats.boatArriveTrade = (source, destination, gold) => {
+      boatArriveTrade(source, destination, gold);
+      this.pendingTradeEvents.push({
+        payout: String(gold),
+        sourcePortOwnerPlayerID: String(source.id()),
+        destinationPortOwnerPlayerID: String(destination.id()),
+        captured: false,
+        provenance: "exact_stats_call"
       });
+    };
+    const boatCapturedTrade = stats.boatCapturedTrade.bind(stats);
+    stats.boatCapturedTrade = (recipient, originalSource, gold) => {
+      boatCapturedTrade(recipient, originalSource, gold);
+      this.pendingTradeEvents.push({
+        payout: String(gold),
+        originalSourcePortOwnerPlayerID: String(originalSource.id()),
+        capturedRecipientPlayerID: String(recipient.id()),
+        captured: true,
+        provenance: "exact_stats_call"
+      });
+    };
+    const trainExternalTrade = stats.trainExternalTrade.bind(stats);
+    stats.trainExternalTrade = (stationOwner, gold) => {
+      trainExternalTrade(stationOwner, gold);
+      this.pendingExternalTrainStops.push({
+        payout: String(gold),
+        stationOwnerPlayerID: String(stationOwner.id())
+      });
+    };
+    const trainSelfTrade = stats.trainSelfTrade.bind(stats);
+    stats.trainSelfTrade = (trainOwner, gold) => {
+      trainSelfTrade(trainOwner, gold);
+      const payout = String(gold);
+      const externalIndex = this.pendingExternalTrainStops.findLastIndex((entry) => entry.payout === payout);
+      const external = externalIndex === -1 ? null : this.pendingExternalTrainStops.splice(externalIndex, 1)[0];
+      this.pendingTrainEvents.push({
+        payout,
+        trainOwnerPlayerID: String(trainOwner.id()),
+        stationOwnerPlayerID: external?.stationOwnerPlayerID ?? String(trainOwner.id()),
+        provenance: "exact_stats_call"
+      });
+    };
+  }
+  flushObservedEvents(tick) {
+    this.tradeEvents.push(...this.pendingTradeEvents.map((event) => ({
+      tick,
+      ...event
+    })));
+    this.trainEvents.push(...this.pendingTrainEvents.map((event) => ({
+      tick,
+      ...event
+    })));
+    this.pendingTradeEvents = [];
+    this.pendingTrainEvents = [];
+    if (this.pendingExternalTrainStops.length > 0) {
+      throw new Error("unpaired exact train stop stats call");
     }
   }
 };
@@ -42414,6 +42438,17 @@ function emptyPassiveSidecars(fromTick, toTick) {
     }
   };
 }
+function resetPassiveBatches(current, tick) {
+  return {
+    ...current,
+    economyStats: tickBatch(tick, tick, []),
+    tradeCompletions: eventBatch(tick, tick, []),
+    trainStops: eventBatch(tick, tick, []),
+    attackStats: tickBatch(tick, tick, []),
+    staticTerrain: null,
+    waterComponents: null
+  };
+}
 function tickBatch(fromTick, toTick, ticks) {
   return { schemaVersion: 1, fromTick, toTick, ticks };
 }
@@ -42438,12 +42473,6 @@ function bigintArray(value) {
 }
 function deltaAt(current, previous, index) {
   return ((current[index] ?? 0n) - (previous?.[index] ?? 0n)).toString();
-}
-function addPayout(target, payout, playerID) {
-  if (payout === "0") return;
-  const recipients = target.get(payout) ?? [];
-  recipients.push(playerID);
-  target.set(payout, recipients);
 }
 function captureUnitsConstructed(game) {
   const types = Object.values(UnitType).sort();

@@ -236,6 +236,45 @@ test("reports an accepted boat intent that cannot spawn", async () => {
   assert.equal(result.transportLifecycle.events[0].unitID, null);
 });
 
+test("observes exact economy participants and retains point sidecars on no-op ingest", async () => {
+  const mirror = new ExactMirror();
+  await mirror.ingest(openingFrame());
+  const [source, destination] = mirror.runner.game.players();
+  mirror.runner.game.stats().boatArriveTrade(source, destination, 12_345n);
+  mirror.runner.game.stats().trainExternalTrade(destination, 678n);
+  mirror.runner.game.stats().trainSelfTrade(source, 678n);
+  const frame = intervalFrame({
+    snapshotCount: 2,
+    tick: 401,
+    decisions: [],
+  });
+  const observed = await mirror.ingest(frame);
+
+  assert.deepEqual(observed.tradeCompletions.events, [{
+    tick: 401,
+    payout: "12345",
+    sourcePortOwnerPlayerID: String(source.id()),
+    destinationPortOwnerPlayerID: String(destination.id()),
+    captured: false,
+    provenance: "exact_stats_call",
+  }]);
+  assert.deepEqual(observed.trainStops.events, [{
+    tick: 401,
+    payout: "678",
+    trainOwnerPlayerID: String(source.id()),
+    stationOwnerPlayerID: String(destination.id()),
+    provenance: "exact_stats_call",
+  }]);
+
+  const repeated = await mirror.ingest(frame);
+  assert.equal(repeated.unitsConstructed.players.length, 12);
+  assert.equal(repeated.unitsConstructed.tick, 401);
+  assert.equal(repeated.mirvLaunches.count, observed.mirvLaunches.count);
+  assert.deepEqual(repeated.spawnState, observed.spawnState);
+  assert.deepEqual(repeated.tradeCompletions.events, []);
+  assert.deepEqual(repeated.trainStops.events, []);
+});
+
 function findBoatIntent(mirror) {
   const runner = mirror.runner;
   const game = runner.game;

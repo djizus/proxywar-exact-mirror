@@ -191,7 +191,7 @@ export class ExactMirror {
   async ingest(frame: unknown): Promise<Record<string, unknown>> {
     const currentTick = this.runner?.game.ticks() ?? 0;
     this.latestTransportBatch = emptyTransportBatch(currentTick, currentTick);
-    this.latestSidecars = emptyPassiveSidecars(currentTick, currentTick);
+    this.latestSidecars = resetPassiveBatches(this.latestSidecars, currentTick);
     if (this.status === "diverged" || this.status === "unavailable") {
       return this.result(null);
     }
@@ -608,6 +608,12 @@ class PassiveSidecarObserver {
   private attackTicks: Array<Record<string, unknown>> = [];
   private tradeEvents: Array<Record<string, unknown>> = [];
   private trainEvents: Array<Record<string, unknown>> = [];
+  private pendingTradeEvents: Array<Record<string, unknown>> = [];
+  private pendingTrainEvents: Array<Record<string, unknown>> = [];
+  private pendingExternalTrainStops: Array<{
+    payout: string;
+    stationOwnerPlayerID: string;
+  }> = [];
   private railroads = new Map<number, number[]>();
   private initialTerrain: Record<string, unknown> | null = null;
   private emitInitialTerrain = false;
@@ -627,6 +633,7 @@ class PassiveSidecarObserver {
       runs: encodeIntegerRuns(terrain),
     };
     this.emitInitialTerrain = true;
+    this.attachStatsHooks(game);
   }
 
   beginBatch(fromTick: number): void {
@@ -662,7 +669,7 @@ class PassiveSidecarObserver {
     const economyPlayers: Array<Record<string, unknown>> = [];
     const attackPlayers: Array<Record<string, unknown>> = [];
 
-    for (const player of game.players().filter((entry) => entry.isPlayer())) {
+    for (const player of game.allPlayers().filter((entry) => entry.isPlayer())) {
       const playerID = String(player.id());
       const prior = before.stats.get(playerID);
       const current = after.get(playerID);
@@ -697,11 +704,11 @@ class PassiveSidecarObserver {
     }
     if (economyPlayers.length > 0) {
       this.economyTicks.push({ tick, players: economyPlayers });
-      this.captureEconomyCompletions(tick, economyPlayers);
     }
     if (attackPlayers.length > 0) {
       this.attackTicks.push({ tick, players: attackPlayers });
     }
+    this.flushObservedEvents(tick);
   }
 
   endBatch(game: Game, toTick: number): PassiveSidecars {
@@ -737,48 +744,69 @@ class PassiveSidecarObserver {
     };
   }
 
-  private captureEconomyCompletions(
-    tick: number,
-    players: Array<Record<string, unknown>>,
-  ): void {
-    const byTradePayout = new Map<string, string[]>();
-    const byTrainSelf = new Map<string, string[]>();
-    const byTrainOther = new Map<string, string[]>();
-    for (const player of players) {
-      const playerID = String(player.playerID);
-      addPayout(byTradePayout, String(player.trade), playerID);
-      addPayout(byTradePayout, String(player.steal), playerID);
-      addPayout(byTrainSelf, String(player.trainSelf), playerID);
-      addPayout(byTrainOther, String(player.trainOther), playerID);
-    }
-    for (const [payout, recipients] of byTradePayout) {
-      if (recipients.length === 2) {
-        this.tradeEvents.push({
-          tick,
-          payout,
-          sourceRecipientPlayerID: recipients[0],
-          destinationRecipientPlayerID: recipients[1],
-          provenance: "exact_stats_delta",
-        });
-      } else if (recipients.length === 1) {
-        this.tradeEvents.push({
-          tick,
-          payout,
-          capturedRecipientPlayerID: recipients[0],
-          provenance: "exact_stats_delta",
-        });
-      }
-    }
-    for (const [payout, trainOwners] of byTrainSelf) {
-      const stationOwners = byTrainOther.get(payout) ?? [];
-      if (trainOwners.length !== 1 || stationOwners.length > 1) continue;
-      this.trainEvents.push({
-        tick,
-        payout,
-        trainOwnerPlayerID: trainOwners[0],
-        stationOwnerPlayerID: stationOwners[0] ?? trainOwners[0],
-        provenance: "exact_stats_delta",
+  private attachStatsHooks(game: Game): void {
+    const stats = game.stats();
+    const boatArriveTrade = stats.boatArriveTrade.bind(stats);
+    stats.boatArriveTrade = (source, destination, gold) => {
+      boatArriveTrade(source, destination, gold);
+      this.pendingTradeEvents.push({
+        payout: String(gold),
+        sourcePortOwnerPlayerID: String(source.id()),
+        destinationPortOwnerPlayerID: String(destination.id()),
+        captured: false,
+        provenance: "exact_stats_call",
       });
+    };
+    const boatCapturedTrade = stats.boatCapturedTrade.bind(stats);
+    stats.boatCapturedTrade = (recipient, originalSource, gold) => {
+      boatCapturedTrade(recipient, originalSource, gold);
+      this.pendingTradeEvents.push({
+        payout: String(gold),
+        originalSourcePortOwnerPlayerID: String(originalSource.id()),
+        capturedRecipientPlayerID: String(recipient.id()),
+        captured: true,
+        provenance: "exact_stats_call",
+      });
+    };
+    const trainExternalTrade = stats.trainExternalTrade.bind(stats);
+    stats.trainExternalTrade = (stationOwner, gold) => {
+      trainExternalTrade(stationOwner, gold);
+      this.pendingExternalTrainStops.push({
+        payout: String(gold),
+        stationOwnerPlayerID: String(stationOwner.id()),
+      });
+    };
+    const trainSelfTrade = stats.trainSelfTrade.bind(stats);
+    stats.trainSelfTrade = (trainOwner, gold) => {
+      trainSelfTrade(trainOwner, gold);
+      const payout = String(gold);
+      const externalIndex = this.pendingExternalTrainStops
+        .findLastIndex((entry) => entry.payout === payout);
+      const external = externalIndex === -1
+        ? null
+        : this.pendingExternalTrainStops.splice(externalIndex, 1)[0];
+      this.pendingTrainEvents.push({
+        payout,
+        trainOwnerPlayerID: String(trainOwner.id()),
+        stationOwnerPlayerID: external?.stationOwnerPlayerID ?? String(trainOwner.id()),
+        provenance: "exact_stats_call",
+      });
+    };
+  }
+
+  private flushObservedEvents(tick: number): void {
+    this.tradeEvents.push(...this.pendingTradeEvents.map((event) => ({
+      tick,
+      ...event,
+    })));
+    this.trainEvents.push(...this.pendingTrainEvents.map((event) => ({
+      tick,
+      ...event,
+    })));
+    this.pendingTradeEvents = [];
+    this.pendingTrainEvents = [];
+    if (this.pendingExternalTrainStops.length > 0) {
+      throw new Error("unpaired exact train stop stats call");
     }
   }
 }
@@ -812,6 +840,21 @@ function emptyPassiveSidecars(
       tradeShips: [],
       trains: [],
     },
+  };
+}
+
+function resetPassiveBatches(
+  current: PassiveSidecars,
+  tick: number,
+): PassiveSidecars {
+  return {
+    ...current,
+    economyStats: tickBatch(tick, tick, []),
+    tradeCompletions: eventBatch(tick, tick, []),
+    trainStops: eventBatch(tick, tick, []),
+    attackStats: tickBatch(tick, tick, []),
+    staticTerrain: null,
+    waterComponents: null,
   };
 }
 
@@ -859,17 +902,6 @@ function deltaAt(
   index: number,
 ): string {
   return ((current[index] ?? 0n) - (previous?.[index] ?? 0n)).toString();
-}
-
-function addPayout(
-  target: Map<string, string[]>,
-  payout: string,
-  playerID: string,
-): void {
-  if (payout === "0") return;
-  const recipients = target.get(payout) ?? [];
-  recipients.push(playerID);
-  target.set(payout, recipients);
 }
 
 function captureUnitsConstructed(game: Game): Record<string, unknown> {
