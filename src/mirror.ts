@@ -649,13 +649,15 @@ class PassiveSidecarObserver {
     for (const entry of update.updates[GameUpdateType.RailroadConstructionEvent] ?? []) {
       this.railroads.set(entry.id, [...entry.tiles]);
     }
-    for (const entry of update.updates[GameUpdateType.RailroadDestructionEvent] ?? []) {
-      this.railroads.delete(entry.id);
-    }
     for (const entry of update.updates[GameUpdateType.RailroadSnapEvent] ?? []) {
       this.railroads.delete(entry.originalId);
       this.railroads.set(entry.newId1, [...entry.tiles1]);
       this.railroads.set(entry.newId2, [...entry.tiles2]);
+    }
+    // A newly snapped segment can be destroyed later in the same canonical
+    // tick, so destruction must win when grouped update types are reconciled.
+    for (const entry of update.updates[GameUpdateType.RailroadDestructionEvent] ?? []) {
+      this.railroads.delete(entry.id);
     }
   }
 

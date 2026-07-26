@@ -275,6 +275,29 @@ test("observes exact economy participants and retains point sidecars on no-op in
   assert.deepEqual(repeated.trainStops.events, []);
 });
 
+test("same-tick railroad destruction wins over a snap-created segment", () => {
+  const observer = new ExactMirror().passiveSidecars;
+  observer.railroads.set(1, [9]);
+  const updates = Array.from({ length: 23 }, () => []);
+  updates[18].push({
+    originalId: 1,
+    newId1: 2,
+    newId2: 3,
+    tiles1: [10],
+    tiles2: [11],
+  });
+  updates[16].push({ id: 2 });
+
+  observer.captureRunnerUpdate({
+    tick: 1,
+    updates,
+    packedTileUpdates: new Uint32Array(),
+    playerNameViewData: {},
+  });
+
+  assert.deepEqual([...observer.railroads], [[3, [11]]]);
+});
+
 function findBoatIntent(mirror) {
   const runner = mirror.runner;
   const game = runner.game;

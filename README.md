@@ -8,12 +8,21 @@ bundles the engine and Pangaea/World map assets, and exposes two operations:
 - `finalize(gameRecord)` independently replays the completed official record
   and compares it with the live mirror using compact tick/hash references.
 
-Schema-2 ingest results include a compact `transportLifecycle` batch. The
+Schema-3 ingest results include a compact `transportLifecycle` batch. The
 mirror observes every canonical engine tick between public snapshots and
 reports transport launch, motion-plan, retreat, arrival, attack-conversion,
 destruction, and path-failure events. Full water paths are not exposed. A
 motion plan provides exact post-launch path length and projected completion;
 pre-launch routes remain estimates owned by the consuming policy.
+
+Schema 3 also exposes passive sidecars outside the canonical `GameState`:
+per-tick economy and attack deltas, exact trade/train payout events, constructed
+unit counts, MIRV launches, shared-border edge counts, rail topology, and
+port/trade-ship/train spawn state. Initial terrain and changed water-component
+connectivity use run-length encoding. Initial terrain is emitted once, while
+event batches cover only newly advanced ticks; point-in-time sidecars are
+retained across duplicate or non-state ingests. None of these fields enter the
+canonical state hash.
 
 Every result carries the immutable Coworld, ProxyWar commit, and game-image
 identity used by the worker. Consumers must verify that identity before using

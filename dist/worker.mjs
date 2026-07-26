@@ -42266,13 +42266,13 @@ var PassiveSidecarObserver = class {
     for (const entry of update.updates[17 /* RailroadConstructionEvent */] ?? []) {
       this.railroads.set(entry.id, [...entry.tiles]);
     }
-    for (const entry of update.updates[16 /* RailroadDestructionEvent */] ?? []) {
-      this.railroads.delete(entry.id);
-    }
     for (const entry of update.updates[18 /* RailroadSnapEvent */] ?? []) {
       this.railroads.delete(entry.originalId);
       this.railroads.set(entry.newId1, [...entry.tiles1]);
       this.railroads.set(entry.newId2, [...entry.tiles2]);
+    }
+    for (const entry of update.updates[16 /* RailroadDestructionEvent */] ?? []) {
+      this.railroads.delete(entry.id);
     }
   }
   beforeTick(game) {
