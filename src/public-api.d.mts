@@ -4,6 +4,8 @@ import type {
   GameState,
   MirrorFinalizeResult,
   MirrorIngestResult,
+  MirrorProjectQuery,
+  MirrorProjectResult,
   MirrorStatus,
   ParityResult,
 } from "./protocol.mjs";
@@ -27,6 +29,7 @@ export declare const CANONICAL_TERRAIN_BYTE_LAYOUT: Readonly<{
 export declare class ExactMirror {
   constructor(options?: { mapRoot?: string });
   ingest(frame: unknown): Promise<MirrorIngestResult>;
+  project(query: MirrorProjectQuery): MirrorProjectResult;
   finalize(gameRecord: unknown): Promise<MirrorFinalizeResult>;
   state(): GameState | null;
 }

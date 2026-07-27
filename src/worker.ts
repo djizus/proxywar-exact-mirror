@@ -31,6 +31,13 @@ async function handle(message: unknown): Promise<MirrorIPCResult> {
       result: await mirror.ingest(request.frame),
     };
   }
+  if (request.type === "project") {
+    return {
+      id: request.id,
+      ok: true,
+      result: mirror.project(request),
+    };
+  }
   return finalize(request);
 }
 
