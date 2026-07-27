@@ -4,6 +4,27 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { createGameRunner, type GameRunner } from "../vendor/proxywar/src/core/GameRunner.ts";
+import { AttackExecution } from "../vendor/proxywar/src/core/execution/AttackExecution.ts";
+import { BoatRetreatExecution } from "../vendor/proxywar/src/core/execution/BoatRetreatExecution.ts";
+import { ConstructionExecution } from "../vendor/proxywar/src/core/execution/ConstructionExecution.ts";
+import { NukeExecution } from "../vendor/proxywar/src/core/execution/NukeExecution.ts";
+import { PlayerExecution } from "../vendor/proxywar/src/core/execution/PlayerExecution.ts";
+import { PortExecution } from "../vendor/proxywar/src/core/execution/PortExecution.ts";
+import { RetreatExecution } from "../vendor/proxywar/src/core/execution/RetreatExecution.ts";
+import { SAMLauncherExecution } from "../vendor/proxywar/src/core/execution/SAMLauncherExecution.ts";
+import { SAMMissileExecution } from "../vendor/proxywar/src/core/execution/SAMMissileExecution.ts";
+import { TradeShipExecution } from "../vendor/proxywar/src/core/execution/TradeShipExecution.ts";
+import { TrainExecution } from "../vendor/proxywar/src/core/execution/TrainExecution.ts";
+import { TrainStationExecution } from "../vendor/proxywar/src/core/execution/TrainStationExecution.ts";
+import { TransportShipExecution } from "../vendor/proxywar/src/core/execution/TransportShipExecution.ts";
+import { WarshipExecution } from "../vendor/proxywar/src/core/execution/WarshipExecution.ts";
+import { AStarWater } from "../vendor/proxywar/src/core/pathfinding/algorithms/AStar.Water.ts";
+import { AStarWaterHierarchical } from "../vendor/proxywar/src/core/pathfinding/algorithms/AStar.WaterHierarchical.ts";
+import { ComponentCheckTransformer } from "../vendor/proxywar/src/core/pathfinding/transformers/ComponentCheckTransformer.ts";
+import { MiniMapTransformer } from "../vendor/proxywar/src/core/pathfinding/transformers/MiniMapTransformer.ts";
+import { ShoreCoercingTransformer } from "../vendor/proxywar/src/core/pathfinding/transformers/ShoreCoercingTransformer.ts";
+import { SmoothingWaterTransformer } from "../vendor/proxywar/src/core/pathfinding/transformers/SmoothingWaterTransformer.ts";
+import type { PathFinder } from "../vendor/proxywar/src/core/pathfinding/types.ts";
 import {
   Difficulty,
   GameMapSize,
@@ -43,9 +64,16 @@ import type {
   BorderTargetsSidecar,
   EconomyPlayerDelta,
   EventBatch,
+  ExecutionPathProgress,
+  ExecutionStateCapability,
+  ExecutionStateCapabilityName,
+  ExecutionStateSidecar,
   GameState,
   MirrorFinalizeResult,
   MirrorIngestResult,
+  MirrorProjectQuery,
+  MirrorProjectRefusalCode,
+  MirrorProjectResult,
   MirrorStatus,
   ParityResult,
   PassiveSidecars,
@@ -62,7 +90,9 @@ import type {
   TransportLifecycleEvent,
   UnitsConstructedSidecar,
   WaterComponentsSidecar,
+  WaterPathExecutionState,
 } from "./protocol.ts";
+import { parseMirrorProjectQuery } from "./protocol.ts";
 
 export * from "./protocol.ts";
 
@@ -186,7 +216,7 @@ export class ExactMirror {
       ? { ok: false, checked: [], mismatches: [{ path: "mirror", expected: "state", actual: null }] }
       : compareStates(this.latestState, official);
     return {
-      schemaVersion: 3,
+      schemaVersion: 4,
       status: parity.ok && this.status !== "diverged" ? this.status : "diverged",
       engine: ENGINE_IDENTITY,
       liveStateRef: stateRef(this.latestState),
@@ -198,6 +228,105 @@ export class ExactMirror {
 
   state(): GameState | null {
     return this.latestState;
+  }
+
+  project(value: MirrorProjectQuery): MirrorProjectResult {
+    const query = parseMirrorProjectQuery(value);
+    const currentStateRef = stateRef(this.latestState);
+    if (this.runner === null || this.latestState === null) {
+      return projectRefusal(
+        query,
+        currentStateRef,
+        "mirror_not_ready",
+        "the mirror has no exact current state",
+      );
+    }
+    if (this.status !== "exact") {
+      return projectRefusal(
+        query,
+        currentStateRef,
+        "mirror_not_exact",
+        `the mirror status is ${this.status}`,
+      );
+    }
+    if (this.runner.game.ticks() !== this.latestState.tick) {
+      return projectRefusal(
+        query,
+        currentStateRef,
+        "mirror_advancing",
+        "the canonical runner is advancing beyond the latest validated state",
+      );
+    }
+    if (query.tick !== this.latestState.tick) {
+      return projectRefusal(
+        query,
+        currentStateRef,
+        "stale_tick",
+        `requested tick ${query.tick} does not match current tick ${this.latestState.tick}`,
+      );
+    }
+    if (query.stateHash !== this.latestState.source.hash) {
+      return projectRefusal(
+        query,
+        currentStateRef,
+        "state_hash_mismatch",
+        "requested stateHash does not match the current canonical state",
+      );
+    }
+
+    const game = this.runner.game;
+    for (let index = 0; index < query.routes.length; index++) {
+      const route = query.routes[index];
+      if (!game.isValidRef(route.source)) {
+        throw new Error(
+          `project routes[${index}].source is outside the current map`,
+        );
+      }
+      if (!game.isValidRef(route.destination)) {
+        throw new Error(
+          `project routes[${index}].destination is outside the current map`,
+        );
+      }
+    }
+
+    const projection = passiveCanonicalWaterPathFinder(game);
+    const routes = query.routes.map(({ source, destination }) => {
+      const path = projection.pathFinder.findPath(source, destination);
+      if (path === null || path.length === 0) {
+        return { source, destination, reachable: false };
+      }
+      const pathLength = path.length;
+      const ticksPerStep = 1;
+      const traversalDurationTicks = Math.max(0, pathLength - 1) *
+        ticksPerStep;
+      const projectedArrivalDurationTicks =
+        ticksPerStep + traversalDurationTicks;
+      return {
+        source,
+        destination,
+        reachable: true,
+        pathLength,
+        ticksPerStep,
+        traversalDurationTicks,
+        projectedArrivalDurationTicks,
+        projectedArrivalTick: query.tick + projectedArrivalDurationTicks,
+      };
+    });
+
+    return {
+      schemaVersion: 4,
+      operation: "project",
+      outcome: "success",
+      engine: ENGINE_IDENTITY,
+      tick: query.tick,
+      stateHash: query.stateHash,
+      geometry: {
+        provenance: "exact_current_water_geometry",
+        algorithm: projection.algorithm,
+        waterGraphVersion: game.waterGraphVersion(),
+      },
+      routes,
+    };
   }
 
   private async bootstrap(global: Record<string, unknown>, snapshot: Record<string, unknown>): Promise<void> {
@@ -307,7 +436,7 @@ export class ExactMirror {
 
   private result(parity: ParityResult | null): MirrorIngestResult {
     return {
-      schemaVersion: 3,
+      schemaVersion: 4,
       status: this.status,
       engine: ENGINE_IDENTITY,
       snapshotCount: this.snapshotCount,
@@ -318,6 +447,61 @@ export class ExactMirror {
       incident: this.incident,
     };
   }
+}
+
+function projectRefusal(
+  query: MirrorProjectQuery,
+  currentStateRef: ReturnType<typeof stateRef>,
+  code: MirrorProjectRefusalCode,
+  message: string,
+): MirrorProjectResult {
+  return {
+    schemaVersion: 4,
+    operation: "project",
+    outcome: "refused",
+    engine: ENGINE_IDENTITY,
+    requested: {
+      tick: query.tick,
+      stateHash: query.stateHash,
+    },
+    currentStateRef,
+    refusal: { code, message },
+  };
+}
+
+function passiveCanonicalWaterPathFinder(game: Game): {
+  pathFinder: PathFinder<number>;
+  algorithm:
+    | "canonical_water_hierarchical"
+    | "canonical_water_simple";
+} {
+  const miniMap = game.miniMap();
+  const graph = game.miniWaterGraph();
+  if (graph === null || graph.nodeCount < 100) {
+    const simple = new AStarWater(miniMap);
+    const shore = new ShoreCoercingTransformer(simple, miniMap);
+    return {
+      pathFinder: new MiniMapTransformer(shore, game.map(), miniMap),
+      algorithm: "canonical_water_simple",
+    };
+  }
+
+  // This recreates PathFinding.Water's canonical stack but deliberately uses
+  // fresh search buffers and disables AbstractGraph path writes. The graph and
+  // maps are read-only inputs owned by the current canonical game.
+  const hierarchical = new AStarWaterHierarchical(miniMap, graph, {
+    cachePaths: false,
+  });
+  const componentCheck = new ComponentCheckTransformer(
+    hierarchical,
+    (tile: number) => graph.getComponentId(tile),
+  );
+  const smoothing = new SmoothingWaterTransformer(componentCheck, miniMap);
+  const shore = new ShoreCoercingTransformer(smoothing, miniMap);
+  return {
+    pathFinder: new MiniMapTransformer(shore, game.map(), miniMap),
+    algorithm: "canonical_water_hierarchical",
+  };
 }
 
 class TransportLifecycleObserver {
@@ -723,6 +907,7 @@ class PassiveSidecarObserver {
         events: [...this.railEvents],
       },
       spawnState: captureSpawnState(game),
+      executionState: captureExecutionState(game),
     };
   }
 
@@ -838,6 +1023,7 @@ function emptyPassiveSidecars(
       tradeShips: [],
       trains: [],
     },
+    executionState: emptyExecutionState(toTick),
   };
 }
 
@@ -979,6 +1165,1118 @@ function captureWaterComponents(
     length: components.length,
     runs: encodeIntegerRuns(components),
   };
+}
+
+const EXECUTION_CAPABILITIES: readonly ExecutionStateCapabilityName[] = [
+  "attacks",
+  "constructions",
+  "transports",
+  "tradeShips",
+  "ports",
+  "trainStations",
+  "trains",
+  "retreats",
+  "nukes",
+  "samInterceptions",
+  "warships",
+  "diplomacy",
+  "playerTiming",
+  "staggerCounters",
+];
+
+type RuntimeRecord = Record<string, unknown>;
+
+function emptyExecutionState(tick: number): ExecutionStateSidecar {
+  return {
+    schemaVersion: 1,
+    tick,
+    capabilities: Object.fromEntries(EXECUTION_CAPABILITIES.map((name) => [
+      name,
+      { available: false, reason: "mirror_not_bootstrapped" },
+    ])) as Record<ExecutionStateCapabilityName, ExecutionStateCapability>,
+  };
+}
+
+function captureExecutionState(game: Game): ExecutionStateSidecar {
+  // Keep this observer read-only. In particular, WaterPathFinder.rebuilt
+  // resets on read, pathfinder stepping/path creation advances caches,
+  // Unit.warshipState writes a derived flag, and destination helpers draw
+  // randomness. Read their backing state and compact counts only.
+  const result = {
+    schemaVersion: 1 as const,
+    tick: game.ticks(),
+    capabilities: {} as Record<
+      ExecutionStateCapabilityName,
+      ExecutionStateCapability
+    >,
+  } as ExecutionStateSidecar;
+  const output = result as unknown as RuntimeRecord;
+  const executions = callArray(game, "executions");
+
+  const capture = (
+    name: ExecutionStateCapabilityName,
+    observer: () => unknown,
+  ): void => {
+    try {
+      output[name] = observer();
+      result.capabilities[name] = { available: true };
+    } catch (error) {
+      delete output[name];
+      result.capabilities[name] = {
+        available: false,
+        reason: String((error as Error)?.message ?? error).slice(0, 500),
+      };
+    }
+  };
+
+  capture("attacks", () => executions
+    .filter((execution) =>
+      execution instanceof AttackExecution && execution.isActive()
+    )
+    .map((execution) => {
+      const state = executionInternals(execution, "AttackExecution", [
+        "attack",
+        "startTroops",
+        "_owner",
+        "_targetID",
+        "sourceTile",
+        "removeTroops",
+        "toConquer",
+      ]);
+      const attack = nullableObject(state.attack, "AttackExecution.attack");
+      const frontier = executionInternals(
+        state.toConquer,
+        "AttackExecution.toConquer",
+        ["size"],
+      );
+      const frontierSize = callFiniteNumber(frontier, "size");
+      return {
+        attackID: attack === null ? null : callString(attack, "id"),
+        ownerPlayerID: objectIdentifier(state._owner, "AttackExecution._owner"),
+        targetPlayerID: identifier(state._targetID),
+        initialized: attack !== null,
+        startTroops: nullableFiniteNumber(state.startTroops),
+        removesOwnerTroops: requiredBoolean(
+          state.removeTroops,
+          "AttackExecution.removeTroops",
+        ),
+        currentTroops: attack === null
+          ? null
+          : callFiniteNumber(attack, "troops"),
+        sourceTile: nullableInteger(state.sourceTile),
+        borderSize: attack === null
+          ? null
+          : callNonnegativeInteger(attack, "borderSize"),
+        frontierSize,
+        retreating: attack === null ? false : callBoolean(attack, "retreating"),
+        retreated: attack === null ? false : callBoolean(attack, "retreated"),
+      };
+    })
+    .sort(byJSON));
+
+  capture("constructions", () => executions
+    .filter((execution) =>
+      execution instanceof ConstructionExecution && execution.isActive()
+    )
+    .map((execution) => {
+      const state = executionInternals(execution, "ConstructionExecution", [
+        "player",
+        "constructionType",
+        "tile",
+        "rocketDirectionUp",
+        "structure",
+      ]);
+      return {
+        ownerPlayerID: objectIdentifier(
+          state.player,
+          "ConstructionExecution.player",
+        ),
+        constructionType: String(state.constructionType),
+        requestedTile: requiredInteger(
+          state.tile,
+          "ConstructionExecution.tile",
+        ),
+        rocketDirectionUp: typeof state.rocketDirectionUp === "boolean"
+          ? state.rocketDirectionUp
+          : null,
+        structureUnitID: nullableObjectID(
+          state.structure,
+          "ConstructionExecution.structure",
+        ),
+        ticksUntilComplete: nullableFiniteNumber(state.ticksUntilComplete),
+      };
+    })
+    .sort(byJSON));
+
+  capture("transports", () => executions
+    .filter((execution) =>
+      execution instanceof TransportShipExecution && execution.isActive()
+    )
+    .map((execution) => {
+      const state = executionInternals(execution, "TransportShipExecution", [
+        "attacker",
+        "originalOwner",
+        "ref",
+        "troops",
+        "ticksPerMove",
+        "motionPlanId",
+        "motionPlanDst",
+      ]);
+      const boat = nullableObject(state.boat, "TransportShipExecution.boat");
+      return {
+        unitID: boat === null ? null : callNonnegativeInteger(boat, "id"),
+        ownerPlayerID: objectIdentifier(
+          state.attacker,
+          "TransportShipExecution.attacker",
+        ),
+        originalOwnerPlayerID: objectIdentifier(
+          state.originalOwner,
+          "TransportShipExecution.originalOwner",
+        ),
+        targetPlayerID: nullableObjectIdentifier(
+          state.target,
+          "TransportShipExecution.target",
+        ),
+        requestedTile: requiredInteger(
+          state.ref,
+          "TransportShipExecution.ref",
+        ),
+        sourceTile: nullableInteger(state.src),
+        currentTile: boat === null ? null : callNonnegativeInteger(boat, "tile"),
+        destinationTile: nullableInteger(state.dst),
+        retreatDestinationTile: nullableInteger(
+          state.retreatDst === false ? null : state.retreatDst,
+        ),
+        troops: requiredFiniteNumber(
+          state.troops,
+          "TransportShipExecution.troops",
+        ),
+        retreating: boat === null
+          ? false
+          : callTransportRetreating(boat),
+        lastMoveTick: nullableFiniteNumber(state.lastMove),
+        ticksPerMove: requiredFiniteNumber(
+          state.ticksPerMove,
+          "TransportShipExecution.ticksPerMove",
+        ),
+        motionPlanID: requiredInteger(
+          state.motionPlanId,
+          "TransportShipExecution.motionPlanId",
+        ),
+        motionPlanDestinationTile: nullableInteger(state.motionPlanDst),
+        path: nullableWaterPathState(state.pathFinder),
+      };
+    })
+    .sort(byJSON));
+
+  capture("tradeShips", () => executions
+    .filter((execution) =>
+      execution instanceof TradeShipExecution && execution.isActive()
+    )
+    .map((execution) => {
+      const state = executionInternals(execution, "TradeShipExecution", [
+        "origOwner",
+        "srcPort",
+        "_dstPort",
+        "wasCaptured",
+        "tilesTraveled",
+        "motionPlanId",
+        "motionPlanDst",
+        "pathFinder",
+      ]);
+      const ship = nullableObject(state.tradeShip, "TradeShipExecution.tradeShip");
+      return {
+        unitID: ship === null ? null : callNonnegativeInteger(ship, "id"),
+        originalOwnerPlayerID: objectIdentifier(
+          state.origOwner,
+          "TradeShipExecution.origOwner",
+        ),
+        currentOwnerPlayerID: ship === null
+          ? null
+          : objectIdentifier(
+            callObject(ship, "owner"),
+            "TradeShipExecution.tradeShip.owner",
+          ),
+        sourcePortUnitID: objectID(
+          state.srcPort,
+          "TradeShipExecution.srcPort",
+        ),
+        destinationPortUnitID: objectID(
+          state._dstPort,
+          "TradeShipExecution._dstPort",
+        ),
+        currentTile: ship === null ? null : callNonnegativeInteger(ship, "tile"),
+        wasCaptured: requiredBoolean(
+          state.wasCaptured,
+          "TradeShipExecution.wasCaptured",
+        ),
+        tilesTraveled: requiredInteger(
+          state.tilesTraveled,
+          "TradeShipExecution.tilesTraveled",
+        ),
+        motionPlanID: requiredInteger(
+          state.motionPlanId,
+          "TradeShipExecution.motionPlanId",
+        ),
+        motionPlanDestinationTile: nullableInteger(state.motionPlanDst),
+        path: nullableWaterPathState(state.pathFinder),
+      };
+    })
+    .sort(byJSON));
+
+  capture("ports", () => executions
+    .filter((execution) =>
+      execution instanceof PortExecution && execution.isActive()
+    )
+    .map((execution) => {
+      const state = executionInternals(execution, "PortExecution", [
+        "port",
+        "mg",
+        "checkOffset",
+        "tradeShipSpawnRejections",
+      ]);
+      const initialized = state.mg !== undefined && state.checkOffset !== undefined;
+      const checkOffset = nullableFiniteNumber(state.checkOffset);
+      const phase = checkOffset === null
+        ? null
+        : (game.ticks() + checkOffset) % 10;
+      return {
+        unitID: objectID(state.port, "PortExecution.port"),
+        ownerPlayerID: objectIdentifier(
+          callObject(state.port, "owner"),
+          "PortExecution.port.owner",
+        ),
+        initialized,
+        checkOffset,
+        tradeShipSpawnRejections: requiredInteger(
+          state.tradeShipSpawnRejections,
+          "PortExecution.tradeShipSpawnRejections",
+        ),
+        rollPhase: phase === null ? null : phase === 0 ? "due" : "waiting",
+        nextRollTick: phase === null
+          ? null
+          : game.ticks() + ((10 - phase) % 10),
+      };
+    })
+    .sort(byJSON));
+
+  capture("trainStations", () => executions
+    .filter((execution) =>
+      execution instanceof TrainStationExecution && execution.isActive()
+    )
+    .map((execution) => {
+      const state = executionInternals(execution, "TrainStationExecution", [
+        "unit",
+        "station",
+        "spawnTrains",
+        "lastSpawnTick",
+        "ticksCooldown",
+      ]);
+      const station = nullableObject(
+        state.station,
+        "TrainStationExecution.station",
+      );
+      const cooldown = requiredInteger(
+        state.ticksCooldown,
+        "TrainStationExecution.ticksCooldown",
+      );
+      const lastSpawnTick = requiredInteger(
+        state.lastSpawnTick,
+        "TrainStationExecution.lastSpawnTick",
+      );
+      const cluster = station === null ? null : callNullableObject(
+        station,
+        "getCluster",
+      );
+      return {
+        unitID: objectID(state.unit, "TrainStationExecution.unit"),
+        ownerPlayerID: objectIdentifier(
+          callObject(state.unit, "owner"),
+          "TrainStationExecution.unit.owner",
+        ),
+        stationID: station === null
+          ? null
+          : requiredInteger(station.id, "TrainStation.id"),
+        stationTile: station === null
+          ? null
+          : callNonnegativeInteger(station, "tile"),
+        clusterSize: cluster === null
+          ? null
+          : callNonnegativeInteger(cluster, "size"),
+        spawnTrains: state.spawnTrains === true,
+        lastSpawnTick,
+        spawnCooldownTicks: cooldown,
+        nextEligibleSpawnTick: lastSpawnTick + cooldown,
+      };
+    })
+    .sort(byJSON));
+
+  capture("trains", () => executions
+    .filter((execution) =>
+      execution instanceof TrainExecution && execution.isActive()
+    )
+    .map((execution) => {
+      const state = executionInternals(execution, "TrainExecution", [
+        "train",
+        "cars",
+        "player",
+        "source",
+        "destination",
+        "currentRailroad",
+        "currentTile",
+        "speed",
+        "spacing",
+        "hasCargo",
+        "_tradeStopsVisited",
+      ]);
+      const train = nullableObject(state.train, "TrainExecution.train");
+      const source = executionInternals(
+        state.source,
+        "TrainExecution.source",
+        ["id", "unit"],
+      );
+      const destination = executionInternals(
+        state.destination,
+        "TrainExecution.destination",
+        ["id", "unit"],
+      );
+      const railroad = nullableObject(
+        state.currentRailroad,
+        "TrainExecution.currentRailroad",
+      );
+      const underlyingRailroad = railroad === null
+        ? null
+        : executionInternals(
+          executionInternals(
+            railroad,
+            "TrainExecution.currentRailroad",
+            ["railroad"],
+          ).railroad,
+          "TrainExecution.currentRailroad.railroad",
+          ["id"],
+        );
+      const cars = requiredArray(state.cars, "TrainExecution.cars");
+      return {
+        unitID: train === null ? null : callNonnegativeInteger(train, "id"),
+        ownerPlayerID: objectIdentifier(
+          state.player,
+          "TrainExecution.player",
+        ),
+        sourceStationID: requiredInteger(
+          source.id,
+          "TrainExecution.source.id",
+        ),
+        sourceUnitID: objectID(
+          source.unit,
+          "TrainExecution.source.unit",
+        ),
+        destinationStationID: requiredInteger(
+          destination.id,
+          "TrainExecution.destination.id",
+        ),
+        destinationUnitID: objectID(
+          destination.unit,
+          "TrainExecution.destination.unit",
+        ),
+        currentRailroadID: underlyingRailroad === null
+          ? null
+          : requiredInteger(
+            underlyingRailroad.id,
+            "TrainExecution.currentRailroad.railroad.id",
+          ),
+        currentRailOffset: requiredInteger(
+          state.currentTile,
+          "TrainExecution.currentTile",
+        ),
+        speed: requiredFiniteNumber(state.speed, "TrainExecution.speed"),
+        spacing: requiredFiniteNumber(state.spacing, "TrainExecution.spacing"),
+        hasCargo: requiredBoolean(
+          state.hasCargo,
+          "TrainExecution.hasCargo",
+        ),
+        tradeStopsVisited: requiredInteger(
+          state._tradeStopsVisited,
+          "TrainExecution._tradeStopsVisited",
+        ),
+        carUnitIDs: cars.map((car, index) =>
+          objectID(car, `TrainExecution.cars[${index}]`)
+        ).sort((left, right) => left - right),
+      };
+    })
+    .sort(byJSON));
+
+  capture("retreats", () => [
+    ...executions
+      .filter((execution) =>
+        execution instanceof RetreatExecution && execution.isActive()
+      )
+      .map((execution) => {
+        const state = executionInternals(execution, "RetreatExecution", [
+          "player",
+          "attackID",
+          "startTick",
+          "retreatOrdered",
+        ]);
+        const startTick = nullableFiniteNumber(state.startTick);
+        return {
+          kind: "attack" as const,
+          ownerPlayerID: objectIdentifier(
+            state.player,
+            "RetreatExecution.player",
+          ),
+          attackID: requiredString(
+            state.attackID,
+            "RetreatExecution.attackID",
+          ),
+          startTick,
+          executeAtTick: startTick === null ? null : startTick + 20,
+          retreatOrdered: requiredBoolean(
+            state.retreatOrdered,
+            "RetreatExecution.retreatOrdered",
+          ),
+        };
+      }),
+    ...executions
+      .filter((execution) =>
+        execution instanceof BoatRetreatExecution && execution.isActive()
+      )
+      .map((execution) => {
+        const state = executionInternals(execution, "BoatRetreatExecution", [
+          "player",
+          "unitID",
+        ]);
+        return {
+          kind: "transport" as const,
+          ownerPlayerID: objectIdentifier(
+            state.player,
+            "BoatRetreatExecution.player",
+          ),
+          unitID: requiredInteger(
+            state.unitID,
+            "BoatRetreatExecution.unitID",
+          ),
+        };
+      }),
+  ].sort(byJSON));
+
+  capture("nukes", () => executions
+    .filter((execution) =>
+      execution instanceof NukeExecution && execution.isActive()
+    )
+    .map((execution) => {
+      const state = executionInternals(execution, "NukeExecution", [
+        "nuke",
+        "nukeType",
+        "player",
+        "src",
+        "dst",
+        "speed",
+        "waitTicks",
+      ]);
+      const nuke = nullableObject(state.nuke, "NukeExecution.nuke");
+      return {
+        unitID: nuke === null ? null : callNonnegativeInteger(nuke, "id"),
+        ownerPlayerID: objectIdentifier(state.player, "NukeExecution.player"),
+        nukeType: String(state.nukeType),
+        sourceTile: nullableInteger(state.src),
+        destinationTile: requiredInteger(state.dst, "NukeExecution.dst"),
+        speed: requiredFiniteNumber(state.speed, "NukeExecution.speed"),
+        waitTicks: requiredInteger(
+          state.waitTicks,
+          "NukeExecution.waitTicks",
+        ),
+        trajectoryIndex: nuke === null
+          ? null
+          : callNonnegativeInteger(nuke, "trajectoryIndex"),
+        trajectoryLength: nuke === null
+          ? null
+          : callArray(nuke, "trajectory").length,
+        targetable: nuke === null ? null : callBoolean(nuke, "isTargetable"),
+        targetedBySAM: nuke === null
+          ? null
+          : callBoolean(nuke, "targetedBySAM"),
+      };
+    })
+    .sort(byJSON));
+
+  capture("samInterceptions", () => [
+    ...executions
+      .filter((execution) =>
+        execution instanceof SAMLauncherExecution && execution.isActive()
+      )
+      .map((execution) => {
+        const state = executionInternals(execution, "SAMLauncherExecution", [
+          "player",
+          "sam",
+        ]);
+        const sam = nullableObject(state.sam, "SAMLauncherExecution.sam");
+        const targeting = nullableObject(
+          state.targetingSystem,
+          "SAMLauncherExecution.targetingSystem",
+        );
+        const plans = targeting === null
+          ? []
+          : [...requiredMap(
+            executionInternals(
+              targeting,
+              "SAMTargetingSystem",
+              ["precomputedNukes"],
+            ).precomputedNukes,
+            "SAMTargetingSystem.precomputedNukes",
+          )].map(([targetUnitID, plan]) => {
+            const interception = nullableObject(
+              plan,
+              "SAMTargetingSystem.precomputedNukes plan",
+            );
+            return {
+              targetUnitID: requiredInteger(
+                targetUnitID,
+                "SAM interception targetUnitID",
+              ),
+              interceptionTile: interception === null
+                ? null
+                : requiredInteger(
+                  interception.tile,
+                  "SAM interception tile",
+                ),
+              interceptionTick: interception === null
+                ? null
+                : requiredInteger(
+                  interception.tick,
+                  "SAM interception tick",
+                ),
+              reachable: interception !== null,
+            };
+          }).sort(byJSON);
+        return {
+          kind: "launcher" as const,
+          launcherUnitID: sam === null
+            ? null
+            : callNonnegativeInteger(sam, "id"),
+          ownerPlayerID: objectIdentifier(
+            state.player,
+            "SAMLauncherExecution.player",
+          ),
+          plans,
+        };
+      }),
+    ...executions
+      .filter((execution) =>
+        execution instanceof SAMMissileExecution && execution.isActive()
+      )
+      .map((execution) => {
+        const state = executionInternals(execution, "SAMMissileExecution", [
+          "SAMMissile",
+          "ownerUnit",
+          "_owner",
+          "target",
+          "targetTile",
+          "speed",
+          "pathFinder",
+        ]);
+        const missile = nullableObject(
+          state.SAMMissile,
+          "SAMMissileExecution.SAMMissile",
+        );
+        return {
+          kind: "missile" as const,
+          missileUnitID: missile === null
+            ? null
+            : callNonnegativeInteger(missile, "id"),
+          launcherUnitID: objectID(
+            state.ownerUnit,
+            "SAMMissileExecution.ownerUnit",
+          ),
+          ownerPlayerID: objectIdentifier(
+            state._owner,
+            "SAMMissileExecution._owner",
+          ),
+          targetUnitID: objectID(
+            state.target,
+            "SAMMissileExecution.target",
+          ),
+          targetTile: requiredInteger(
+            state.targetTile,
+            "SAMMissileExecution.targetTile",
+          ),
+          speed: requiredFiniteNumber(
+            state.speed,
+            "SAMMissileExecution.speed",
+          ),
+          progress: nullablePathProgress(state.pathFinder),
+        };
+      }),
+  ].sort(byJSON));
+
+  capture("warships", () => executions
+    .filter((execution) =>
+      execution instanceof WarshipExecution && execution.isActive()
+    )
+    .map((execution) => {
+      const state = executionInternals(execution, "WarshipExecution", [
+        "lastShellAttack",
+        "lastManualMoveTickRetreatDisabled",
+        "lastObservedPatrolTile",
+        "activeHealingRemainder",
+        "alreadySentShell",
+        "pathfinder",
+      ]);
+      const warship = nullableObject(state.warship, "WarshipExecution.warship");
+      const unitState = warship === null
+        ? null
+        : nullableObject(
+          executionInternals(warship, "Warship unit", ["_warshipState"])
+            ._warshipState,
+          "Warship unit._warshipState",
+        );
+      if (unitState !== null) {
+        executionInternals(unitState, "Warship unit._warshipState", [
+          "state",
+          "patrolTile",
+          "lastCombatTick",
+        ]);
+      }
+      return {
+        unitID: warship === null ? null : callNonnegativeInteger(warship, "id"),
+        ownerPlayerID: warship === null
+          ? null
+          : objectIdentifier(callObject(warship, "owner"), "Warship owner"),
+        tile: warship === null ? null : callNonnegativeInteger(warship, "tile"),
+        health: warship === null ? null : callFiniteNumber(warship, "health"),
+        state: unitState === null ? null : String(unitState.state),
+        patrolTile: unitState === null ? null : nullableInteger(unitState.patrolTile),
+        retreatPortTile: unitState === null
+          ? null
+          : nullableInteger(unitState.retreatPort),
+        targetUnitID: warship === null
+          ? null
+          : nullableObjectID(callNullableObject(warship, "targetUnit"), "Warship target"),
+        targetTile: warship === null
+          ? null
+          : nullableInteger(callUnknown(warship, "targetTile")),
+        lastCombatTick: unitState === null
+          ? null
+          : nullableFiniteNumber(unitState.lastCombatTick),
+        lastShellAttackTick: requiredFiniteNumber(
+          state.lastShellAttack,
+          "WarshipExecution.lastShellAttack",
+        ),
+        lastManualMoveTick: requiredFiniteNumber(
+          state.lastManualMoveTickRetreatDisabled,
+          "WarshipExecution.lastManualMoveTickRetreatDisabled",
+        ),
+        lastObservedPatrolTile: nullableInteger(state.lastObservedPatrolTile),
+        activeHealingRemainder: requiredFiniteNumber(
+          state.activeHealingRemainder,
+          "WarshipExecution.activeHealingRemainder",
+        ),
+        alreadySentShellTargetUnitIDs: [...requiredSet(
+          state.alreadySentShell,
+          "WarshipExecution.alreadySentShell",
+        )].map((unit) =>
+          objectID(unit, "WarshipExecution.alreadySentShell unit")
+        ).sort((left, right) => left - right),
+        path: nullableWaterPathState(state.pathfinder),
+      };
+    })
+    .sort(byJSON));
+
+  capture("diplomacy", () => {
+    const requests = new Set(
+      game.allPlayers().flatMap((player) => player.outgoingAllianceRequests()),
+    );
+    const duration = game.config().allianceRequestDuration();
+    return {
+      alliances: game.alliances().map((alliance) => ({
+        allianceID: alliance.id(),
+        requestorPlayerID: String(alliance.requestor().id()),
+        recipientPlayerID: String(alliance.recipient().id()),
+        createdAtTick: alliance.createdAt(),
+        expiresAtTick: alliance.expiresAt(),
+        requestorAgreedToExtend: alliance.agreedToExtend(alliance.requestor()),
+        recipientAgreedToExtend: alliance.agreedToExtend(alliance.recipient()),
+      })).sort(byJSON),
+      requests: [...requests].map((request) => ({
+        requestorPlayerID: String(request.requestor().id()),
+        recipientPlayerID: String(request.recipient().id()),
+        createdAtTick: request.createdAt(),
+        rejectAfterTick: request.createdAt() + duration,
+        status: request.status(),
+      })).sort(byJSON),
+    };
+  });
+
+  capture("playerTiming", () => {
+    const playerExecutions = new Map(executions
+      .filter((execution) =>
+        execution instanceof PlayerExecution && execution.isActive()
+      )
+      .map((execution) => {
+        const state = executionInternals(execution, "PlayerExecution", [
+          "player",
+          "lastCalc",
+          "ticksPerClusterCalc",
+        ]);
+        return [
+          objectIdentifier(state.player, "PlayerExecution.player"),
+          state,
+        ] as const;
+      }));
+    return game.allPlayers().filter((player) => player.isPlayer())
+      .map((player) => {
+        const state = executionInternals(player, "PlayerImpl", [
+          "_lastTileChange",
+          "markedTraitorTick",
+          "lastDeleteUnitTick",
+          "lastEmbargoAllTick",
+          "targets_",
+          "sentDonations",
+          "outgoingEmojis_",
+          "pastOutgoingAllianceRequests",
+        ]);
+        const playerID = String(player.id());
+        const playerExecution = playerExecutions.get(playerID);
+        return {
+          playerID,
+          lastTileChangeTick: requiredFiniteNumber(
+            state._lastTileChange,
+            "PlayerImpl._lastTileChange",
+          ),
+          markedTraitorTick: requiredFiniteNumber(
+            state.markedTraitorTick,
+            "PlayerImpl.markedTraitorTick",
+          ),
+          lastDeleteUnitTick: requiredFiniteNumber(
+            state.lastDeleteUnitTick,
+            "PlayerImpl.lastDeleteUnitTick",
+          ),
+          lastEmbargoAllTick: requiredFiniteNumber(
+            state.lastEmbargoAllTick,
+            "PlayerImpl.lastEmbargoAllTick",
+          ),
+          lastClusterCalculationTick: playerExecution === undefined
+            ? null
+            : requiredFiniteNumber(
+              playerExecution.lastCalc,
+              "PlayerExecution.lastCalc",
+            ),
+          clusterCalculationPeriod: playerExecution === undefined
+            ? null
+            : requiredInteger(
+              playerExecution.ticksPerClusterCalc,
+              "PlayerExecution.ticksPerClusterCalc",
+            ),
+          targets: requiredArray(state.targets_, "PlayerImpl.targets_")
+            .map((entry) => {
+              const target = executionInternals(entry, "Player target", [
+                "target",
+                "tick",
+              ]);
+              return {
+                targetPlayerID: objectIdentifier(
+                  target.target,
+                  "Player target.target",
+                ),
+                tick: requiredFiniteNumber(target.tick, "Player target.tick"),
+              };
+            }).sort(byJSON),
+          lastDonationTicks: latestTicksByRecipient(
+            requiredArray(state.sentDonations, "PlayerImpl.sentDonations"),
+            "Player donation",
+          ),
+          lastEmojiTicks: latestEmojiTicks(
+            requiredArray(state.outgoingEmojis_, "PlayerImpl.outgoingEmojis_"),
+          ),
+          lastAllianceRequestTicks: latestAllianceRequestTicks(
+            requiredArray(
+              state.pastOutgoingAllianceRequests,
+              "PlayerImpl.pastOutgoingAllianceRequests",
+            ),
+          ),
+        };
+      }).sort(byJSON);
+  });
+
+  capture("staggerCounters", () => {
+    // These counters are process-static in the pinned engine. The worker owns
+    // one mirror, so a direct read is the exact next-allocation state without
+    // mutating the counter or exposing either pathfinder's PRNG.
+    const transports = executionInternals(
+      TransportShipExecution,
+      "TransportShipExecution constructor",
+      ["_staggerCounter"],
+    );
+    const tradeShips = executionInternals(
+      TradeShipExecution,
+      "TradeShipExecution constructor",
+      ["_staggerCounter"],
+    );
+    return {
+      transportShips: requiredInteger(
+        transports._staggerCounter,
+        "TransportShipExecution._staggerCounter",
+      ),
+      tradeShips: requiredInteger(
+        tradeShips._staggerCounter,
+        "TradeShipExecution._staggerCounter",
+      ),
+    };
+  });
+
+  return result;
+}
+
+function executionInternals(
+  value: unknown,
+  label: string,
+  fields: readonly string[],
+): RuntimeRecord {
+  const record = asRecord(value) ??
+    (typeof value === "function" ? value as unknown as RuntimeRecord : null);
+  if (record === null) throw new Error(`${label} is unavailable`);
+  for (const field of fields) {
+    if (!(field in record)) throw new Error(`${label}.${field} is unavailable`);
+  }
+  return record;
+}
+
+function nullableObject(value: unknown, label: string): RuntimeRecord | null {
+  if (value === null || value === undefined) return null;
+  return executionInternals(value, label, []);
+}
+
+function requiredArray(value: unknown, label: string): unknown[] {
+  if (!Array.isArray(value)) throw new Error(`${label} is not an array`);
+  return value;
+}
+
+function requiredMap(value: unknown, label: string): Map<unknown, unknown> {
+  if (!(value instanceof Map)) throw new Error(`${label} is not a map`);
+  return value;
+}
+
+function requiredSet(value: unknown, label: string): Set<unknown> {
+  if (!(value instanceof Set)) throw new Error(`${label} is not a set`);
+  return value;
+}
+
+function requiredString(value: unknown, label: string): string {
+  if (typeof value !== "string") throw new Error(`${label} is not a string`);
+  return value;
+}
+
+function requiredBoolean(value: unknown, label: string): boolean {
+  if (typeof value !== "boolean") throw new Error(`${label} is not boolean`);
+  return value;
+}
+
+function requiredFiniteNumber(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error(`${label} is not a finite number`);
+  }
+  return value;
+}
+
+function nullableFiniteNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function requiredInteger(value: unknown, label: string): number {
+  const result = requiredFiniteNumber(value, label);
+  if (!Number.isInteger(result)) throw new Error(`${label} is not an integer`);
+  return result;
+}
+
+function callUnknown(
+  value: unknown,
+  method: string,
+  ...args: unknown[]
+): unknown {
+  const record = executionInternals(value, "execution object", [method]);
+  const fn = record[method];
+  if (typeof fn !== "function") throw new Error(`${method} is not callable`);
+  return fn.apply(value, args);
+}
+
+function callObject(value: unknown, method: string): RuntimeRecord {
+  return executionInternals(callUnknown(value, method), `${method} result`, []);
+}
+
+function callNullableObject(
+  value: unknown,
+  method: string,
+): RuntimeRecord | null {
+  return nullableObject(callUnknown(value, method), `${method} result`);
+}
+
+function callArray(value: unknown, method: string): unknown[] {
+  return requiredArray(callUnknown(value, method), `${method} result`);
+}
+
+function callFiniteNumber(value: unknown, method: string): number {
+  return requiredFiniteNumber(callUnknown(value, method), `${method} result`);
+}
+
+function callNonnegativeInteger(value: unknown, method: string): number {
+  const result = requiredInteger(callUnknown(value, method), `${method} result`);
+  if (result < 0) throw new Error(`${method} result is negative`);
+  return result;
+}
+
+function callString(value: unknown, method: string): string {
+  return requiredString(callUnknown(value, method), `${method} result`);
+}
+
+function callBoolean(value: unknown, method: string): boolean {
+  return requiredBoolean(callUnknown(value, method), `${method} result`);
+}
+
+function objectIdentifier(value: unknown, label: string): string {
+  const id = callUnknown(value, "id");
+  if (id === null || id === undefined) throw new Error(`${label}.id is null`);
+  return String(id);
+}
+
+function nullableObjectIdentifier(value: unknown, label: string): string | null {
+  if (value === null || value === undefined) return null;
+  return identifier(callUnknown(value, "id"));
+}
+
+function objectID(value: unknown, label: string): number {
+  if (value === null || value === undefined) {
+    throw new Error(`${label} is unavailable`);
+  }
+  return callNonnegativeInteger(value, "id");
+}
+
+function nullableObjectID(value: unknown, label: string): number | null {
+  if (value === null || value === undefined) return null;
+  return objectID(value, label);
+}
+
+function callTransportRetreating(boat: RuntimeRecord): boolean {
+  const state = callObject(boat, "transportShipState");
+  return requiredBoolean(
+    state.isRetreating,
+    "transportShipState.isRetreating",
+  );
+}
+
+function nullableWaterPathState(value: unknown): WaterPathExecutionState | null {
+  if (value === null || value === undefined) return null;
+  const state = executionInternals(value, "WaterPathFinder", [
+    "_waterGraphVersion",
+    "_pendingVersion",
+    "_stagger",
+    "_staggerCountdown",
+    "inner",
+  ]);
+  return {
+    graphVersion: requiredInteger(
+      state._waterGraphVersion,
+      "WaterPathFinder._waterGraphVersion",
+    ),
+    pendingGraphVersion: requiredInteger(
+      state._pendingVersion,
+      "WaterPathFinder._pendingVersion",
+    ),
+    stagger: requiredInteger(state._stagger, "WaterPathFinder._stagger"),
+    staggerCountdown: requiredInteger(
+      state._staggerCountdown,
+      "WaterPathFinder._staggerCountdown",
+    ),
+    progress: nullablePathProgress(state.inner),
+  };
+}
+
+function nullablePathProgress(value: unknown): ExecutionPathProgress | null {
+  if (value === null || value === undefined) return null;
+  const state = executionInternals(value, "PathFinderStepper", [
+    "path",
+    "pathIndex",
+  ]);
+  if (state.path === null) return null;
+  const pathLength = requiredArray(
+    state.path,
+    "PathFinderStepper.path",
+  ).length;
+  const pathIndex = requiredInteger(
+    state.pathIndex,
+    "PathFinderStepper.pathIndex",
+  );
+  return {
+    pathIndex,
+    pathLength,
+    remainingSteps: Math.max(0, pathLength - pathIndex),
+  };
+}
+
+function latestTicksByRecipient(
+  values: unknown[],
+  label: string,
+): Array<{ recipientPlayerID: string; tick: number }> {
+  const latest = new Map<string, number>();
+  for (const value of values) {
+    const entry = executionInternals(value, label, ["recipient", "tick"]);
+    const recipientPlayerID = objectIdentifier(
+      entry.recipient,
+      `${label}.recipient`,
+    );
+    const tick = requiredFiniteNumber(entry.tick, `${label}.tick`);
+    latest.set(recipientPlayerID, Math.max(latest.get(recipientPlayerID) ?? -1, tick));
+  }
+  return [...latest].map(([recipientPlayerID, tick]) => ({
+    recipientPlayerID,
+    tick,
+  })).sort(byJSON);
+}
+
+function latestEmojiTicks(
+  values: unknown[],
+): Array<{ recipientSmallID: number | string; tick: number }> {
+  const latest = new Map<number | string, number>();
+  for (const value of values) {
+    const entry = executionInternals(value, "Player emoji", [
+      "recipientID",
+      "createdAt",
+    ]);
+    if (
+      typeof entry.recipientID !== "number" &&
+      typeof entry.recipientID !== "string"
+    ) {
+      throw new Error("Player emoji.recipientID is invalid");
+    }
+    const tick = requiredFiniteNumber(entry.createdAt, "Player emoji.createdAt");
+    latest.set(
+      entry.recipientID,
+      Math.max(latest.get(entry.recipientID) ?? -1, tick),
+    );
+  }
+  return [...latest].map(([recipientSmallID, tick]) => ({
+    recipientSmallID,
+    tick,
+  })).sort(byJSON);
+}
+
+function latestAllianceRequestTicks(
+  values: unknown[],
+): Array<{ recipientPlayerID: string; tick: number }> {
+  const latest = new Map<string, number>();
+  for (const request of values) {
+    const recipientPlayerID = objectIdentifier(
+      callObject(request, "recipient"),
+      "AllianceRequest.recipient",
+    );
+    const tick = callFiniteNumber(request, "createdAt");
+    latest.set(
+      recipientPlayerID,
+      Math.max(latest.get(recipientPlayerID) ?? -1, tick),
+    );
+  }
+  return [...latest].map(([recipientPlayerID, tick]) => ({
+    recipientPlayerID,
+    tick,
+  })).sort(byJSON);
 }
 
 function captureSpawnState(game: Game): SpawnStateSidecar {
